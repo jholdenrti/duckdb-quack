@@ -1,5 +1,7 @@
 #include "storage/quack_transaction_manager.hpp"
 
+#include "duckdb/main/client_context.hpp"
+
 namespace duckdb {
 
 QuackTransactionManager::QuackTransactionManager(AttachedDatabase &db_p, QuackCatalog &quack_catalog_p)
@@ -9,6 +11,13 @@ QuackTransactionManager::QuackTransactionManager(AttachedDatabase &db_p, QuackCa
 Transaction &QuackTransactionManager::StartTransaction(ClientContext &context) {
 	auto transaction = make_uniq<QuackTransaction>(quack_catalog, *this, context);
 	transaction->Start();
+	// For an explicit transaction (BEGIN), open it server-side eagerly so that every operation
+	// against this catalog - including appends and raw rpc.query() statements that don't route
+	// through QuackTransaction::Query() - participates in it. Autocommit single statements stay
+	// lazy to avoid needless BEGIN/COMMIT round-trips.
+	if (!context.transaction.IsAutoCommit()) {
+		transaction->ForceStart();
+	}
 	auto &result = *transaction;
 	lock_guard<mutex> l(transaction_lock);
 	transactions[result] = std::move(transaction);

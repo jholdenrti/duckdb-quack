@@ -131,6 +131,70 @@ from rpc.fuu3;
 not exist
 
 
+# DML-only transaction against a pre-existing table. Regression: the lazy BEGIN used to be
+# triggered only by DDL, so an INSERT-only transaction auto-committed and ROLLBACK was a no-op.
+statement ok
+create table rpc.fuu4(i integer);
+
+statement ok
+begin transaction
+
+statement ok
+insert into rpc.fuu4 from range(100);
+
+query I
+from rpc.fuu4 select count(i);
+----
+100
+
+statement ok
+rollback
+
+query I
+from rpc.fuu4 select count(i);
+----
+0
+
+# COMMIT on a DML-only transaction must persist
+statement ok
+begin transaction
+
+statement ok
+insert into rpc.fuu4 from range(5);
+
+statement ok
+commit
+
+query I
+from rpc.fuu4 select count(i);
+----
+5
+
+# Raw-SQL writes via rpc.query() must also participate in an explicit transaction
+# (covers the opaque query path, which doesn't route through QuackTransaction::Query).
+statement ok
+begin transaction
+
+statement ok
+from rpc.query('insert into fuu4 from range(7)');
+
+query I
+from rpc.fuu4 select count(i);
+----
+12
+
+statement ok
+rollback
+
+query I
+from rpc.fuu4 select count(i);
+----
+5
+
+statement ok
+drop table rpc.fuu4;
+
+
 statement ok con2
 detach rpc;
 
