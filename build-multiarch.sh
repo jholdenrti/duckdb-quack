@@ -42,12 +42,12 @@ build_arch() {
 
 	# Move and rename the extension with arch suffix
 	mv "${BUILD_DIR}/tmp_${arch}/${EXTENSION_NAME}.duckdb_extension" \
-		"${BUILD_DIR}/${EXTENSION_NAME}_${suffix}.duckdb_extension"
+		"${BUILD_DIR}/${EXTENSION_NAME}.${suffix}.duckdb_extension"
 
 	# Clean up temp directory
 	rmdir "${BUILD_DIR}/tmp_${arch}"
 
-	echo "Built: ${BUILD_DIR}/${EXTENSION_NAME}_${suffix}.duckdb_extension"
+	echo "Built: ${BUILD_DIR}/${EXTENSION_NAME}.${suffix}.duckdb_extension"
 }
 
 # Build for both architectures

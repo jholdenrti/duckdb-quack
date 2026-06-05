@@ -1,0 +1,15 @@
+# Keep host-only build artifacts out of the Docker context.
+# Docker COPY does not honor .gitignore, so the host build/ tree (with a
+# CMakeCache.txt pinned to the host path) would otherwise poison the in-image build.
+build
+.cache
+.idea
+cmake-build-debug
+duckdb_unittest_tempdir/
+.DS_Store
+testext
+vcpkg
+
+# Version control and CI metadata are not needed inside the image.
+.git
+.github
