@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-# Build script for multi-arch Linux DuckDB ducklake extension
+# Build script for multi-arch Linux DuckDB quack extension
 # Builds for linux_arm64 and linux_amd64
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build/artifacts"
-EXTENSION_NAME="ducklake"
+EXTENSION_NAME="quack"
 
 echo "=== Multi-arch DuckDB Extension Builder ==="
 echo "Building ${EXTENSION_NAME} for linux_arm64 and linux_amd64"
