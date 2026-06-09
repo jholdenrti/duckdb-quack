@@ -43,6 +43,19 @@ unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientCo
 
 	HTTPHeaders headers;
 
+	// Inject client_query_id from context into the message before sending.
+	// Guard against reading the active query during transaction start itself
+	// (e.g. BEGIN TRANSACTION via QuackCatalog::ExecuteCommand), where the
+	// transaction isn't yet installed on the TransactionContext.
+	optional_idx client_query_id;
+	if (context && context->transaction.HasActiveTransaction()) {
+		auto raw_query_id = context->transaction.GetActiveQuery();
+		if (raw_query_id != DConstants::INVALID_INDEX) {
+			client_query_id = raw_query_id;
+			request_message->SetClientQueryId(client_query_id);
+		}
+	}
+
 	request_message->ToMemoryStream(write_stream);
 	PostRequestInfo post_request(request_url, headers, *http_params, write_stream.GetData(),
 	                             write_stream.GetPosition());
@@ -92,18 +105,6 @@ unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientCo
 			break;
 		default:
 			break;
-		}
-
-		// Inject client_query_id from context into the message before sending.
-		// Guard against reading the active query during transaction start itself
-		// (e.g. BEGIN TRANSACTION via QuackCatalog::ExecuteCommand), where the
-		// transaction isn't yet installed on the TransactionContext.
-		if (context && context->transaction.HasActiveTransaction()) {
-			auto raw_query_id = context->transaction.GetActiveQuery();
-			if (raw_query_id != DConstants::INVALID_INDEX) {
-				client_query_id = raw_query_id;
-				request_message->SetClientQueryId(client_query_id);
-			}
 		}
 
 		// Log RPC message
