@@ -1,0 +1,55 @@
+# name: test/sql/attach_catalog_large.test_slow
+# description: catalog load must FETCH past the first batch (regression for ExecuteCommandInternal truncation)
+# group: [sql]
+
+require quack
+
+require httpfs
+
+set ignore_error_messages __none__
+
+# Shrink the server batch to a single 2048-row chunk so a feasible number of
+# tables (>2048) forces the catalog-load query to span more than one FETCH
+# batch. Pre-fix, QuackCatalog::ExecuteCommandInternal read only the first
+# PREPARE batch and silently dropped every table past it. GLOBAL because the
+# server reads this from the shared DBConfig, not the client connection's state.
+statement ok
+SET GLOBAL quack_fetch_batch_chunks=1;
+
+# 2100 tables. The catalog-load query orders by name (duckdb_tables() is
+# name-sorted), so the lexicographically-largest name "t999" lands in the
+# last (52-row) batch; pre-fix it never loads and a lookup of rpc.t999 fails,
+# while the smallest name "t0" (first row) loads either way.
+loop i 0 2100
+
+statement ok
+create table t${i} as select ${i} as v;
+
+endloop
+
+foreach server 'quack:localhost'
+
+statement ok con1
+call quack_serve({server}, token='asdf');
+
+statement ok con2
+attach {server} as rpc (token 'asdf');
+
+query I con2
+select v from rpc.t0;
+----
+0
+
+# Only resolves once the catalog load issues the follow-up FETCH for batch 2.
+query I con2
+select v from rpc.t999;
+----
+999
+
+statement ok con2
+detach rpc;
+
+statement ok con1
+call quack_stop({server});
+
+endloop

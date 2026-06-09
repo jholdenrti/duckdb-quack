@@ -66,7 +66,6 @@ const QuackUri &QuackCatalog::GetServerUri() {
 }
 
 unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
-	// FIXME this will break with many results!
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
 	auto client_wrapper = client_connection->GetClient(context);
@@ -76,6 +75,24 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientCont
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
+	}
+	// The first PREPARE batch only carries up to quack_fetch_batch_chunks chunks. If the result is
+	// larger, keep issuing FETCH on the same connection/result until the server returns an empty
+	// batch (mirrors the data-path loop in QuackScan). Without this, catalog loads silently
+	// truncate above ~one batch of rows (~24k by default), dropping tables/schemas.
+	if (response->NeedsMoreFetch()) {
+		auto result_uuid = response->ResultUUID();
+		while (true) {
+			auto fetch_response = client.Request<FetchResponseMessage>(
+			    context, make_uniq<FetchRequestMessage>(GetConnectionId(), result_uuid));
+			if (fetch_response->MutableResults().empty()) {
+				// server is done
+				break;
+			}
+			for (auto &chunk : fetch_response->MutableResults()) {
+				chunk_collection->Append(chunk->Chunk());
+			}
+		}
 	}
 	return chunk_collection;
 }
