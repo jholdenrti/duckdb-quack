@@ -6,6 +6,8 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "storage/quack_view.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/column_list.hpp"
 
 namespace duckdb {
 
@@ -39,6 +41,24 @@ QuackTableSet::QuackTableSet(ClientContext &context, QuackSchemaCatalogEntry &pa
 			if (info->type != CatalogType::TABLE_ENTRY) {
 				throw InternalException("Expected a CREATE TABLE");
 			}
+			// quack serves tables remotely and treats them as opaque for local
+			// planning — only column names + types matter. Reduce the parsed
+			// definition to name+type, dropping column DEFAULT/generated
+			// expressions and table constraints, BEFORE binding. Binding a
+			// DEFAULT/CHECK expression (e.g. DEFAULT current_timestamp, or a PK
+			// that resolves a sequence/function) resolves names against this
+			// catalog — which is NOT yet registered during LoadCatalog (we are
+			// mid-ATTACH). That lookup throws `Catalog "__ducklake_metadata_dl"
+			// does not exist` and aborts the entire ATTACH, so any catalog
+			// containing a table with a default expression fails to re-attach.
+			// Reducing to name+type keeps binding free of catalog resolution.
+			auto &create_info = info->Cast<CreateTableInfo>();
+			ColumnList stripped;
+			for (auto &col : create_info.columns.Logical()) {
+				stripped.AddColumn(ColumnDefinition(col.Name(), col.Type()));
+			}
+			create_info.columns = std::move(stripped);
+			create_info.constraints.clear();
 			// bind to resolve the types
 			auto binder = Binder::CreateBinder(context);
 			auto bound_info = binder->BindCreateTableInfo(std::move(info), schema);
