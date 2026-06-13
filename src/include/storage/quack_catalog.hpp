@@ -59,6 +59,12 @@ public:
 	string GetDBPath() override;
 
 	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query);
+	//! Execute a metadata command on a specific connection (used by QuackTransaction
+	//! to keep all of a transaction's SQL on its pinned, checked-out connection).
+	//! The primary-connection overload above remains for ATTACH-time LoadCatalog /
+	//! Refresh, which always run on the catalog's primary connection.
+	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query,
+	                                                        QuackClientConnection &conn);
 	const QuackUri &GetServerUri();
 	const string &GetConnectionId();
 

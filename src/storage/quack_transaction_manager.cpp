@@ -27,6 +27,7 @@ ErrorData QuackTransactionManager::CommitTransaction(ClientContext &context, Tra
 	auto &quack_transaction = transaction.Cast<QuackTransaction>();
 	quack_transaction.Commit();
 	lock_guard<mutex> l(transaction_lock);
+	// The pinned pooled connection was already released back to the pool by Commit().
 	transactions.erase(transaction);
 	return ErrorData();
 }
@@ -35,6 +36,7 @@ void QuackTransactionManager::RollbackTransaction(Transaction &transaction) {
 	auto &quack_transaction = transaction.Cast<QuackTransaction>();
 	quack_transaction.Rollback();
 	lock_guard<mutex> l(transaction_lock);
+	// The pinned pooled connection was already released back to the pool by Rollback().
 	transactions.erase(transaction);
 }
 

@@ -8,6 +8,7 @@
 #include "quack_scan.hpp"
 #include "quack_client.hpp"
 #include "include/storage/quack_catalog.hpp"
+#include "storage/quack_transaction.hpp"
 
 #include <queue>
 namespace duckdb {
@@ -89,7 +90,30 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 
 	auto query = input.inputs[1].GetValue<string>();
 	auto bind_data = make_uniq<QuackScanBindData>();
-	bind_data->client_connection = catalog.GetClientConnection();
+	// Resolve the connection from the ACTIVE transaction so all metadata SQL of a
+	// DuckLake metadata transaction lands on that transaction's pinned, pooled
+	// connection_id (per-transaction affinity, design.md Approach #4). DuckLake's
+	// metadata path always has an active transaction (its private connection issues
+	// an explicit BEGIN before any metadata query), so this resolves to the pooled
+	// connection. A bare-quack / non-transactional caller has no active transaction
+	// for this catalog and degrades to the catalog's primary connection.
+	//
+	// INVARIANT (spec §5.2): we resolve the connection at BIND time and store it in
+	// bind_data for use by InitGlobal/InitLocal/Scan within THIS bind only. We must
+	// NOT cache it across transactions - each metadata CALL re-binds, so a reused or
+	// cached plan can never reference a connection that has since been released back
+	// to the pool. Do not hoist this resolution to a longer-lived cache.
+	{
+		auto transaction = Transaction::TryGet(context, catalog.GetAttached());
+		if (transaction) {
+			// Active transaction for this catalog: use its pinned pooled connection.
+			auto &quack_transaction = transaction->Cast<QuackTransaction>();
+			bind_data->client_connection = quack_transaction.GetConnection(context).shared_from_this();
+		} else {
+			// No active transaction (bare-quack caller): fall back to the primary.
+			bind_data->client_connection = catalog.GetClientConnection();
+		}
+	}
 	auto client_wrapper = bind_data->client_connection->GetClient(context);
 	auto &client = client_wrapper->GetClient();
 	auto bind_response = client.Request<PrepareResponseMessage>(

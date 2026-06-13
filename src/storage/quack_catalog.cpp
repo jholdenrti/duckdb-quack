@@ -163,12 +163,17 @@ const QuackUri &QuackCatalog::GetServerUri() {
 }
 
 unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
+	return ExecuteCommandInternal(context, query, *client_connection);
+}
+
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query,
+                                                                      QuackClientConnection &conn) {
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
-	auto client_wrapper = client_connection->GetClient(context);
+	auto client_wrapper = conn.GetClient(context);
 	auto &client = client_wrapper->GetClient();
 	auto response =
-	    client.Request<PrepareResponseMessage>(context, make_uniq<PrepareRequestMessage>(GetConnectionId(), query));
+	    client.Request<PrepareResponseMessage>(context, make_uniq<PrepareRequestMessage>(conn.ConnectionId(), query));
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
@@ -181,7 +186,7 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientCont
 		auto result_uuid = response->ResultUUID();
 		while (true) {
 			auto fetch_response = client.Request<FetchResponseMessage>(
-			    context, make_uniq<FetchRequestMessage>(GetConnectionId(), result_uuid));
+			    context, make_uniq<FetchRequestMessage>(conn.ConnectionId(), result_uuid));
 			if (fetch_response->MutableResults().empty()) {
 				// server is done
 				break;
