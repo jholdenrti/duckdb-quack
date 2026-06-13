@@ -1,0 +1,168 @@
+# name: test/sql/pool_size.test
+# description: connection pooling — pool_size attach option, pool_status, default regression
+# group: [sql]
+
+require quack
+
+require httpfs
+
+set ignore_error_messages __none__
+
+statement ok
+create table fuu as values(42, 43);
+
+foreach server 'quack:localhost'
+
+statement ok con1
+call quack_serve({server}, token='asdf');
+
+# (A) ATTACH with the pool_size option succeeds and is reported by quack_pool_status().
+# At rest (before any query) the implementation initializes the pool to the primary
+# only: live_count = 1 (the primary connection created at ATTACH), in_use = idle = 0,
+# and the cumulative wait/timeout counters are 0. Verified against the build, not
+# guessed (see quack_catalog.cpp: live_count starts at 1, CheckoutConnection mints
+# lazily on first checkout).
+statement ok con2
+attach {server} as p (token 'asdf', pool_size 4)
+
+query IIIIII con1
+select pool_size, live, in_use, idle, checkout_wait_us, checkout_timeouts
+from quack_pool_status() where catalog='p';
+----
+4	1	0	0	0	0
+
+# (B) Default attach: pool_size defaults to 1 (byte-for-byte today's single-lane
+# behavior) and a normal query through it still works.
+statement ok con2
+attach {server} as d (token 'asdf')
+
+query I con1
+select pool_size from quack_pool_status() where catalog='d';
+----
+1
+
+query II con2
+from d.fuu;
+----
+42	43
+
+# default catalog stays single-lane after the read: still just the primary.
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='d';
+----
+1	0	0
+
+# (C) Explicit transaction on the default (pool_size 1) catalog: the per-transaction
+# affinity path resolves to the primary connection (the pool_size==1 fast path mints
+# no new connection) and releases cleanly on COMMIT. This is the release-after-commit
+# lifecycle exercised on the connection the harness CAN drive; at pool_size 1 the
+# checked-out connection IS the primary, so in_use stays 0 by design.
+statement ok con2
+begin transaction
+
+query II con2
+from d.fuu;
+----
+42	43
+
+statement ok con2
+from d.fuu;
+
+statement ok con2
+commit
+
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='d';
+----
+1	0	0
+
+# Same lifecycle ending in ROLLBACK.
+statement ok con2
+begin transaction
+
+query II con2
+from d.fuu;
+----
+42	43
+
+statement ok con2
+rollback
+
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='d';
+----
+1	0	0
+
+# (D) Autocommit reads through a pool_size>1 catalog work and leave the pool clean.
+# NOTE: an autocommit metadata read resolves to the catalog's PRIMARY connection —
+# the per-transaction pooled checkout only fires when an explicit transaction is
+# already active at bind time (design.md Approach #4 / quack_scan.cpp uses
+# Transaction::TryGet). So this exercises the pool_size>1 attach + read path without
+# growing the pool.
+query II con2
+from p.fuu;
+----
+42	43
+
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='p';
+----
+1	0	0
+
+# (E) quack_pool_status() reports every attached quack catalog.
+query I con1
+select count(*) from quack_pool_status();
+----
+2
+
+# (F) A bad table reference is a clean bind error and does not perturb the pool
+# counters (no connection is leaked or left checked out).
+statement error con2
+from p.does_not_exist;
+----
+does not exist
+
+query IIII con1
+select pool_size, live, in_use, idle from quack_pool_status() where catalog='p';
+----
+4	1	0	0
+
+# ------------------------------------------------------------------------------
+# NOT ASSERTED HERE (documented, not faked):
+#
+# Growing the pool past one connection — and therefore the in_use 0->1->0
+# transition, the release-after-COMMIT/ROLLBACK of a *pooled* (non-primary)
+# connection, affinity across a genuinely held checkout, and exhaustion
+# backpressure — all require checking a SECOND connection out of the pool. That
+# pooled checkout only fires from inside an explicit transaction (above), and
+# minting the second connection deadlocks against THIS in-process test server:
+# quack_serve runs the server on the SAME DuckDB instance as the client
+# (quack_server.cpp captures context.db; CreateNewConnection does
+# make_uniq<Connection>(*db)), so a mint issued from inside a held transaction on
+# that shared instance never returns. Against a real out-of-process quack server
+# (the production DuckLake metadata path) the client and server are different
+# instances and the mint completes normally.
+#
+# These behaviors are therefore covered by design/spec review and would need an
+# out-of-process server (a C++ or Go integration test) to assert at runtime. They
+# are intentionally left unasserted rather than asserted vacuously. The same
+# limitation is documented at the connection-count level in
+# pool_concurrency.test_slow.
+# ------------------------------------------------------------------------------
+
+statement ok con2
+detach p;
+
+statement ok con2
+detach d;
+
+# detach removes the catalog from quack_pool_status().
+query I con1
+select count(*) from quack_pool_status();
+----
+0
+
+statement ok con1
+call quack_stop({server});
+
+endloop
