@@ -34,6 +34,11 @@ public:
 protected:
 	QuackCatalog &catalog;
 
+	//! Atomically replace the full contents of the entry map. Used by
+	//! QuackSchemaSet::Reload so a concurrent reader never sees a
+	//! partially-rebuilt cache. See design.md section 6.
+	void ReplaceEntries(case_insensitive_map_t<unique_ptr<CatalogEntry>> new_entries);
+
 private:
 	mutable mutex entry_lock;
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> entries;

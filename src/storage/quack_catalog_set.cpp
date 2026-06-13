@@ -40,6 +40,11 @@ void QuackCatalogSet::Clear() {
 	entries.clear();
 }
 
+void QuackCatalogSet::ReplaceEntries(case_insensitive_map_t<unique_ptr<CatalogEntry>> new_entries) {
+	lock_guard<mutex> l(entry_lock);
+	entries = std::move(new_entries);
+}
+
 optional_ptr<CatalogEntry> QuackCatalogSet::CreateEntry(unique_ptr<CatalogEntry> entry, OnCreateConflict on_conflict) {
 	lock_guard<mutex> l(entry_lock);
 	auto &entry_name = entry->name;

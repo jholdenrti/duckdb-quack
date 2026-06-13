@@ -17,15 +17,24 @@ QuackSchemaSet::QuackSchemaSet(ClientContext &context, QuackCatalog &catalog, co
 }
 
 void QuackSchemaSet::Reload(ClientContext &context, QuackCatalog &catalog, const QuackLoadCatalogData &load_data) {
-	Clear();
+	// Build the new entry set into a local map OFF-LOCK — constructing
+	// QuackSchemaCatalogEntry objects is expensive and must not happen while
+	// holding entry_lock — then commit it with a single atomic swap via
+	// ReplaceEntries so a concurrent pooled reader never observes a partially
+	// rebuilt cache. Reachable concurrently via quack_clear_cache()->Refresh.
+	// See design.md section 6.
+	case_insensitive_map_t<unique_ptr<CatalogEntry>> new_entries;
 	for (auto &row : load_data.schemas->Rows()) {
 		CreateSchemaInfo info;
 		info.catalog = row.GetValue(0).GetValue<string>();
 		info.schema = row.GetValue(1).GetValue<string>();
 		// TODO this will fail if there are two schemas with the same name in different catalogs :/
 		auto schema = make_uniq<QuackSchemaCatalogEntry>(context, catalog, info, load_data);
-		CreateEntry(std::move(schema), OnCreateConflict::REPLACE_ON_CONFLICT);
+		// REPLACE_ON_CONFLICT last-wins: a duplicate schema name overwrites the earlier entry.
+		auto schema_name = schema->name;
+		new_entries[schema_name] = std::move(schema);
 	}
+	ReplaceEntries(std::move(new_entries));
 }
 
 string QuackSchemaSet::GetLoadQuery() {
