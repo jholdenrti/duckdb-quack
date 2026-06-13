@@ -103,16 +103,14 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	// NOT cache it across transactions - each metadata CALL re-binds, so a reused or
 	// cached plan can never reference a connection that has since been released back
 	// to the pool. Do not hoist this resolution to a longer-lived cache.
-	{
-		auto transaction = Transaction::TryGet(context, catalog.GetAttached());
-		if (transaction) {
-			// Active transaction for this catalog: use its pinned pooled connection.
-			auto &quack_transaction = transaction->Cast<QuackTransaction>();
-			bind_data->client_connection = quack_transaction.GetConnection(context).shared_from_this();
-		} else {
-			// No active transaction (bare-quack caller): fall back to the primary.
-			bind_data->client_connection = catalog.GetClientConnection();
-		}
+	auto transaction = Transaction::TryGet(context, catalog.GetAttached());
+	if (transaction) {
+		// Active transaction for this catalog: use its pinned pooled connection.
+		auto &quack_transaction = transaction->Cast<QuackTransaction>();
+		bind_data->client_connection = quack_transaction.GetConnection(context).shared_from_this();
+	} else {
+		// No active transaction (bare-quack caller): fall back to the primary.
+		bind_data->client_connection = catalog.GetClientConnection();
 	}
 	auto client_wrapper = bind_data->client_connection->GetClient(context);
 	auto &client = client_wrapper->GetClient();

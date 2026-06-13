@@ -71,9 +71,9 @@ shared_ptr<QuackClientConnection> QuackCatalog::CheckoutConnection(ClientContext
 		if (live_count < pool_size) {
 			live_count++;
 			in_use_count++;
-			// Mint outside the lock would be cleaner, but ConnectToServer is
-			// safe to call here; keep it simple. If ConnectToServer throws,
-			// roll back the counts so the pool stays consistent.
+			// Reserve the slot under the lock, then mint outside it so a slow
+			// ConnectToServer doesn't block other checkouts. If ConnectToServer
+			// throws, roll back the counts so the pool stays consistent.
 			guard.unlock();
 			try {
 				auto conn = QuackClient::ConnectToServer(context, GetServerUri(), token);

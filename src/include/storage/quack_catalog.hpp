@@ -117,7 +117,7 @@ private:
 	idx_t pool_size;
 
 	//! Authentication token captured at ATTACH time, needed to mint new
-	//! pooled connections. The catalog does not store this today, so add it.
+	//! pooled connections.
 	string token;
 
 	//! Guards the pool bookkeeping below.
