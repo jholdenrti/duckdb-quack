@@ -21,8 +21,8 @@
 namespace duckdb {
 
 QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
-                           const string &token)
-    : Catalog(db_p) {
+                           const string &token, idx_t pool_size)
+    : Catalog(db_p), pool_size(pool_size) {
 	// connect to the server
 	client_connection = QuackClient::ConnectToServer(context, server_uri, token);
 
