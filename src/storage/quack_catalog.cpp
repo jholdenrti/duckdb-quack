@@ -16,13 +16,15 @@
 #include "quack_client.hpp"
 #include "storage/quack_transaction.hpp"
 
+#include <chrono>
+
 // FIXME bunch of stuff copied from postgres scanner, can probably be simplified!
 
 namespace duckdb {
 
 QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
                            const string &token, idx_t pool_size)
-    : Catalog(db_p), pool_size(pool_size) {
+    : Catalog(db_p), pool_size(pool_size), token(token) {
 	// connect to the server
 	client_connection = QuackClient::ConnectToServer(context, server_uri, token);
 
@@ -39,6 +41,101 @@ QuackLoadCatalogData QuackCatalog::LoadCatalog(ClientContext &context) {
 }
 
 QuackCatalog::~QuackCatalog() {
+	// Idle pooled connections in `idle_connections` are released here when
+	// the deque is destroyed: each QuackClientConnection's dtor sends a
+	// DISCONNECT to the server. Checked-out connections (held by the
+	// caller) DISCONNECT when the caller drops them. The primary
+	// `client_connection` DISCONNECTs the same way. No explicit cleanup
+	// is required.
+}
+
+shared_ptr<QuackClientConnection> QuackCatalog::CheckoutConnection(ClientContext &context) {
+	// Fast path: single-connection catalogs (default) always use the primary.
+	// This is load-bearing for bare-quack correctness (see design §4.1-4.2):
+	// primary stays the only connection and no new server ids are minted.
+	if (pool_size <= 1) {
+		return client_connection;
+	}
+
+	unique_lock<mutex> guard(pool_lock);
+	while (true) {
+		// 1) Reuse an idle pooled connection if one is available.
+		if (!idle_connections.empty()) {
+			auto conn = idle_connections.front();
+			idle_connections.pop_front();
+			in_use_count++;
+			return conn;
+		}
+		// 2) Lazily grow the pool up to pool_size. live_count includes the
+		//    primary, so the pool can mint (pool_size - 1) extra connections.
+		if (live_count < pool_size) {
+			live_count++;
+			in_use_count++;
+			// Mint outside the lock would be cleaner, but ConnectToServer is
+			// safe to call here; keep it simple. If ConnectToServer throws,
+			// roll back the counts so the pool stays consistent.
+			guard.unlock();
+			try {
+				auto conn = QuackClient::ConnectToServer(context, GetServerUri(), token);
+				return conn;
+			} catch (...) {
+				guard.lock();
+				live_count--;
+				in_use_count--;
+				pool_cv.notify_one();
+				throw;
+			}
+		}
+		// 3) Saturated: block until a connection is released or we time out /
+		//    the query is interrupted. Bound the wait so we never hang.
+		//    Accumulate the blocked time into checkout_wait_us for observability
+		//    (quack_pool_status / spec §7.4); measure across the wait_for call
+		//    while still holding pool_lock so the counter update is guarded.
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto wait_start = std::chrono::steady_clock::now();
+		auto status = pool_cv.wait_for(guard, std::chrono::seconds(5));
+		checkout_wait_us += (idx_t)std::chrono::duration_cast<std::chrono::microseconds>(
+		                        std::chrono::steady_clock::now() - wait_start)
+		                        .count();
+		if (status == std::cv_status::timeout) {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			// Record the give-up before throwing (still under pool_lock).
+			checkout_timeout_count++;
+			throw IOException(
+			    "quack connection pool exhausted: all %llu connections are in use and none "
+			    "were released within the timeout",
+			    (unsigned long long)pool_size);
+		}
+		// Spurious or genuine wakeup: loop and re-evaluate.
+	}
+}
+
+void QuackCatalog::ReleaseConnection(const shared_ptr<QuackClientConnection> &conn, bool dirty) {
+	// Nothing to return for the single-connection fast path or the primary.
+	if (pool_size <= 1 || conn.get() == client_connection.get()) {
+		return;
+	}
+	lock_guard<mutex> guard(pool_lock);
+	if (in_use_count > 0) {
+		in_use_count--;
+	}
+	if (dirty) {
+		// Discard: do not return a dirty connection to the idle set. We do
+		// not retain it here, so the caller's shared_ptr is the last owner;
+		// when it drops, QuackClientConnection's dtor DISCONNECTs. Free the
+		// slot so a future checkout can mint a replacement.
+		if (live_count > 1) {
+			live_count--;
+		}
+	} else {
+		// Clean connection: return it to the warm idle set for reuse.
+		idle_connections.push_back(conn);
+	}
+	pool_cv.notify_one();
 }
 
 void QuackCatalog::Initialize(bool load_builtin) {

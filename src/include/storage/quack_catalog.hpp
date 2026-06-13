@@ -12,6 +12,10 @@
 #include "storage/quack_schema.hpp"
 #include "quack_uri.hpp"
 
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+
 namespace duckdb {
 
 class QuackCatalog;
@@ -60,6 +64,20 @@ public:
 
 	shared_ptr<QuackClientConnection> GetClientConnection();
 
+	//! Check out a connection for the duration of a unit of work. At
+	//! pool_size == 1 this returns the primary connection directly (no new
+	//! server-side connection ids are minted). Otherwise it returns an idle
+	//! pooled connection, lazily mints a new one if live_count < pool_size,
+	//! or blocks (bounded by the context's interrupt/cancellation and a
+	//! finite default timeout) until one is released — throwing on timeout.
+	shared_ptr<QuackClientConnection> CheckoutConnection(ClientContext &context);
+
+	//! Return a connection previously obtained from CheckoutConnection. At
+	//! pool_size == 1, or when conn is the primary, this is a no-op. If
+	//! `dirty` is true the connection is discarded (dropped so its dtor
+	//! DISCONNECTs) instead of being returned to the idle set.
+	void ReleaseConnection(const shared_ptr<QuackClientConnection> &conn, bool dirty);
+
 	idx_t PoolSize() const {
 		return pool_size;
 	}
@@ -75,6 +93,31 @@ private:
 	shared_ptr<QuackClientConnection> client_connection;
 	unique_ptr<QuackSchemaSet> schemas;
 	idx_t pool_size;
+
+	//! Authentication token captured at ATTACH time, needed to mint new
+	//! pooled connections. The catalog does not store this today, so add it.
+	string token;
+
+	//! Guards the pool bookkeeping below.
+	mutex pool_lock;
+	//! Signalled when a connection is released, to wake a blocked checkout.
+	std::condition_variable pool_cv;
+	//! Warm, idle pooled connections available for checkout (does NOT include
+	//! the primary `client_connection`). On catalog destruction these drop and
+	//! their QuackClientConnection dtors DISCONNECT from the server.
+	std::deque<shared_ptr<QuackClientConnection>> idle_connections;
+	//! Total live connections counted against pool_size: the primary plus any
+	//! lazily-minted pooled connections (idle or checked out). Starts at 1.
+	idx_t live_count = 1;
+	//! Connections currently checked out (excludes the primary fast path).
+	idx_t in_use_count = 0;
+	//! Cumulative time (microseconds) callers spent BLOCKED in CheckoutConnection
+	//! waiting for a connection to free up under saturation. Surfaced by
+	//! quack_pool_status() (design success criteria / spec §7.4 "checkout-wait").
+	idx_t checkout_wait_us = 0;
+	//! Cumulative count of checkouts that gave up because the pool stayed
+	//! saturated past the wait timeout. Surfaced by quack_pool_status().
+	idx_t checkout_timeout_count = 0;
 };
 
 } // namespace duckdb
