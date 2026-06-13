@@ -138,6 +138,18 @@ void QuackCatalog::ReleaseConnection(const shared_ptr<QuackClientConnection> &co
 	pool_cv.notify_one();
 }
 
+QuackPoolStats QuackCatalog::GetPoolStats() {
+	lock_guard<mutex> guard(pool_lock);
+	QuackPoolStats stats;
+	stats.pool_size = pool_size;
+	stats.live = live_count;
+	stats.in_use = in_use_count;
+	stats.idle = idle_connections.size();
+	stats.checkout_wait_us = checkout_wait_us;
+	stats.checkout_timeouts = checkout_timeout_count;
+	return stats;
+}
+
 void QuackCatalog::Initialize(bool load_builtin) {
 }
 

@@ -22,6 +22,18 @@ class QuackCatalog;
 class QuackClient;
 class QuackClientConnection;
 
+//! Snapshot of one catalog's connection-pool state, returned by
+//! QuackCatalog::GetPoolStats() and surfaced by the quack_pool_status()
+//! table function (client-side observability, design §7.4).
+struct QuackPoolStats {
+	idx_t pool_size;
+	idx_t live;
+	idx_t in_use;
+	idx_t idle;
+	idx_t checkout_wait_us;
+	idx_t checkout_timeouts;
+};
+
 class QuackCatalog : public Catalog {
 public:
 	explicit QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri_p, ClientContext &context,
@@ -87,6 +99,10 @@ public:
 	idx_t PoolSize() const {
 		return pool_size;
 	}
+
+	//! Read a consistent snapshot of the connection-pool counters under
+	//! pool_lock. Used by the quack_pool_status() table function.
+	QuackPoolStats GetPoolStats();
 
 	void Refresh(ClientContext &context);
 
