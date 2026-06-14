@@ -35,6 +35,17 @@ public:
 	static unique_ptr<QuackClient> GetClient(ClientContext &context, const QuackUri &uri);
 
 	static shared_ptr<QuackClientConnection> ConnectToServer(ClientContext &context, const QuackUri &uri, string token);
+	//! Context-free connect: performs the CONNECT handshake without a ClientContext,
+	//! so it can run from inside an in-flight query/transaction without re-entering
+	//! the busy context's lock. Requires a non-empty token (no secret-manager
+	//! fallback, since that needs a context) — resolve it once at ATTACH via
+	//! ResolveToken and store it on the catalog.
+	static shared_ptr<QuackClientConnection> ConnectToServer(DatabaseInstance &db, const QuackUri &uri, string token);
+	//! Resolve an auth token: if `token` is non-empty return it unchanged; otherwise
+	//! look it up from the secret manager (TYPE QUACK secret matching `uri`). Shared
+	//! by the context ConnectToServer and the catalog ctor so the token stored for
+	//! later context-free mints is identical to the one the primary connection uses.
+	static string ResolveToken(ClientContext &context, const QuackUri &uri, string token);
 
 protected:
 	mutex request_mutex;

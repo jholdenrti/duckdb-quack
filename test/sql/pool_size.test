@@ -127,27 +127,75 @@ select pool_size, live, in_use, idle from quack_pool_status() where catalog='p';
 ----
 4	1	0	0
 
+# (G) Explicit transaction on the pool_size>1 catalog 'p' checks out a POOLED
+# (non-primary) connection and holds it for the transaction's lifetime, growing the
+# pool from 1 to 2 live connections. The checkout is observable from con1 while
+# con2's transaction is still open. This is the direct regression guard for the
+# connection-mint deadlock: before the context-free-mint fix, minting the pooled
+# connection from inside the transaction re-entered the in-flight query's
+# ClientContext lock and hung the client (in-process AND out-of-process). It now
+# completes — the mint runs context-free (quack_catalog.cpp CheckoutConnection ->
+# QuackClient::ConnectToServer(DatabaseInstance&, ...)).
+statement ok con2
+begin transaction
+
+query II con2
+from p.fuu;
+----
+42	43
+
+# con1 observes the held pooled checkout while con2's transaction is still open.
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='p';
+----
+2	1	0
+
+statement ok con2
+commit
+
+# After COMMIT the pooled connection is RELEASED back to the idle set (not
+# destroyed): live stays 2, in_use returns to 0, one warm idle connection remains.
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='p';
+----
+2	0	1
+
+# (H) A second transaction REUSES the warm idle connection — no new mint, so live
+# stays 2 (idle 1->0 while held), and ROLLBACK returns it cleanly to idle.
+statement ok con2
+begin transaction
+
+query II con2
+from p.fuu;
+----
+42	43
+
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='p';
+----
+2	1	0
+
+statement ok con2
+rollback
+
+query III con1
+select live, in_use, idle from quack_pool_status() where catalog='p';
+----
+2	0	1
+
 # ------------------------------------------------------------------------------
-# NOT ASSERTED HERE (documented, not faked):
+# STILL NOT ASSERTED HERE (needs real concurrency, documented not faked):
+# Exhaustion backpressure / checkout timeout requires pool_size connections held
+# SIMULTANEOUSLY — i.e. N concurrent in-flight transactions. sqllogic drives one
+# statement at a time per connection, so it cannot hold multiple pooled checkouts
+# at once. That path is covered by the out-of-process integration harness
+# (test/integration/pool_two_process.sh) and by design review.
 #
-# Growing the pool past one connection — and therefore the in_use 0->1->0
-# transition, the release-after-COMMIT/ROLLBACK of a *pooled* (non-primary)
-# connection, affinity across a genuinely held checkout, and exhaustion
-# backpressure — all require checking a SECOND connection out of the pool. That
-# pooled checkout only fires from inside an explicit transaction (above), and
-# minting the second connection deadlocks against THIS in-process test server:
-# quack_serve runs the server on the SAME DuckDB instance as the client
-# (quack_server.cpp captures context.db; CreateNewConnection does
-# make_uniq<Connection>(*db)), so a mint issued from inside a held transaction on
-# that shared instance never returns. Against a real out-of-process quack server
-# (the production DuckLake metadata path) the client and server are different
-# instances and the mint completes normally.
-#
-# These behaviors are therefore covered by design/spec review and would need an
-# out-of-process server (a C++ or Go integration test) to assert at runtime. They
-# are intentionally left unasserted rather than asserted vacuously. The same
-# limitation is documented at the connection-count level in
-# pool_concurrency.test_slow.
+# (The previous version of this block claimed pool growth itself deadlocks the
+# in-process server. That was WRONG: the deadlock was a client-side ClientContext
+# re-entry during the mint, not the shared in-process instance, and it reproduced
+# out-of-process too. It is fixed by the context-free mint, and growth is now
+# asserted directly in (G)/(H) above.)
 # ------------------------------------------------------------------------------
 
 statement ok con2

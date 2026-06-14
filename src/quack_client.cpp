@@ -155,8 +155,7 @@ QuackClientConnection::~QuackClientConnection() {
 	}
 }
 
-shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &context, const QuackUri &uri,
-                                                               string token) {
+string QuackClient::ResolveToken(ClientContext &context, const QuackUri &uri, string token) {
 	// if no token is provided fetch it from the secret manager
 	if (token.empty()) {
 		auto &secret_manager = SecretManager::Get(context);
@@ -167,6 +166,12 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 			token = kv.TryGetValue("token", true).ToString();
 		}
 	}
+	return token;
+}
+
+shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &context, const QuackUri &uri,
+                                                               string token) {
+	token = ResolveToken(context, uri, token);
 	if (token.empty()) {
 		throw InvalidInputException("Could not find a Quack authentication token");
 	}
@@ -179,6 +184,19 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 	    client->Request<ConnectionResponseMessage>(context, make_uniq<ConnectionRequestMessage>(token));
 	// success! we got a connection id
 	// construct the client connection and return it
+	auto connection_id = connection_request_response->ConnectionId();
+	return make_shared_ptr<QuackClientConnection>(std::move(client), uri, std::move(connection_id));
+}
+
+shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(DatabaseInstance &db, const QuackUri &uri, string token) {
+	if (token.empty()) {
+		throw InvalidInputException("Context-free ConnectToServer requires a non-empty token");
+	}
+	// open a HTTP client and do the CONNECT handshake WITHOUT a ClientContext, so a
+	// lazy mint from inside an in-flight query does not re-enter the busy context lock.
+	auto client = QuackClient::GetClient(db, uri);
+	auto connection_request_response =
+	    client->Request<ConnectionResponseMessage>(nullptr, make_uniq<ConnectionRequestMessage>(token));
 	auto connection_id = connection_request_response->ConnectionId();
 	return make_shared_ptr<QuackClientConnection>(std::move(client), uri, std::move(connection_id));
 }

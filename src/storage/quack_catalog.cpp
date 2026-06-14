@@ -23,8 +23,17 @@
 namespace duckdb {
 
 QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
-                           const string &token, idx_t pool_size)
-    : Catalog(db_p), pool_size(pool_size), token(token) {
+                           const string &token_p, idx_t pool_size)
+    : Catalog(db_p), pool_size(pool_size) {
+	// Resolve the auth token once, here at ATTACH, where a ClientContext and the
+	// secret manager are available, and store it. Lazy pooled mints later run
+	// context-free (ConnectToServer(DatabaseInstance&, ...)) so they cannot consult
+	// the secret manager and must reuse this resolved token. Production attaches the
+	// admin catalog with a TYPE QUACK secret and no explicit token option (interface
+	// init.sql), so without this the stored token would be empty and every pooled
+	// mint would throw.
+	token = QuackClient::ResolveToken(context, server_uri, token_p);
+
 	// connect to the server
 	client_connection = QuackClient::ConnectToServer(context, server_uri, token);
 
@@ -76,7 +85,15 @@ shared_ptr<QuackClientConnection> QuackCatalog::CheckoutConnection(ClientContext
 			// throws, roll back the counts so the pool stays consistent.
 			guard.unlock();
 			try {
-				auto conn = QuackClient::ConnectToServer(context, GetServerUri(), token);
+				// Context-free mint: do NOT thread the in-flight query's ClientContext
+				// into the CONNECT handshake. Doing so re-enters that context's lock
+				// (HTTPUtil::InitializeParameters / GetActiveQuery run under it) and
+				// deadlocks the whole client. Minting via the DatabaseInstance avoids
+				// the busy context entirely. The auth token comes from the catalog
+				// (resolved at ATTACH); the per-request EXTRA_HTTP_HEADERS secrets are
+				// injected by httpfs at request time keyed on URL + the instance secret
+				// manager, so they apply to context-free requests too.
+				auto conn = QuackClient::ConnectToServer(*context.db, GetServerUri(), token);
 				return conn;
 			} catch (...) {
 				guard.lock();
