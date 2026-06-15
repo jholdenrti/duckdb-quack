@@ -60,8 +60,15 @@ private:
 
 class QuackClientConnection : public enable_shared_from_this<QuackClientConnection> {
 public:
+	// max_connections_cached caps how many idle keep-alive clients this
+	// connection_id retains for reuse. A single query can check out several
+	// clients concurrently (parallel metadata/data-file RPCs); anything beyond
+	// this cap is destroyed on return, closing its connection and churning a fresh
+	// TCP connection (and a TIME_WAIT socket) on the next checkout. Caching the
+	// working set instead keeps those connections alive and reused. Default sized
+	// to cover typical per-query RPC concurrency.
 	explicit QuackClientConnection(unique_ptr<QuackClient> client_p, QuackUri uri_p, string connection_id_p,
-	                               idx_t max_connections_cached = 1);
+	                               idx_t max_connections_cached = 8);
 	~QuackClientConnection();
 
 	const string &ConnectionId() const {
@@ -106,6 +113,14 @@ private:
 
 private:
 	unique_ptr<HTTPParams> http_params;
+	// Persistent keep-alive client to quackd, reused across every RPC this client
+	// issues. Passing it to the two-arg HTTPUtil::Request makes SendRequest lazily
+	// initialize it once and reuse the underlying connection; the one-arg overload
+	// instead builds and tears down a client per call, which opened a fresh TCP
+	// connection per RPC and churned TIME_WAIT sockets to ephemeral-port
+	// exhaustion under concurrency. request_mutex serializes all use of this
+	// client, so a single reused connection is safe.
+	unique_ptr<HTTPClient> http_client;
 };
 
 } // namespace duckdb
