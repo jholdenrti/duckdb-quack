@@ -38,7 +38,8 @@ QuackServer::~QuackServer() {
 vector<QuackConnectionSnapshot> QuackServer::GetActiveConnectionSnap() {
 	vector<QuackConnectionSnapshot> result;
 	std::lock_guard<std::mutex> lock(active_connections_mutex);
-	for (auto &[id, conn] : active_connections) {
+	for (auto &conn_kv : active_connections) {
+		auto &conn = conn_kv.second;
 		QuackConnectionSnapshot snapshot;
 		snapshot.session_id = conn->session_id;
 		snapshot.sql_query = conn->sql_query;
