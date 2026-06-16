@@ -103,7 +103,26 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	// NOT cache it across transactions - each metadata CALL re-binds, so a reused or
 	// cached plan can never reference a connection that has since been released back
 	// to the pool. Do not hoist this resolution to a longer-lived cache.
-	auto transaction = Transaction::TryGet(context, catalog.GetAttached());
+	// Resolve the pooled connection from the ACTIVE transaction. We must use the
+	// STARTING Transaction::Get here, not TryGet: TryGet only returns a transaction
+	// that has already been registered on this catalog, and DuckLake's private
+	// metadata connection never touches the quack catalog before this bind - so
+	// TryGet always returned null and every metadata read silently degraded to the
+	// single shared primary connection_id (serializing all reads server-side, since
+	// the quack server keeps one in-flight result per connection_id). Get() lazily
+	// starts the per-catalog QuackTransaction, which checks out its own pooled
+	// connection for the transaction's lifetime (per-transaction affinity).
+	//
+	// Gated on pool_size > 1: at the default pool_size == 1 every checkout returns
+	// the shared primary, so starting a per-transaction QuackTransaction would only
+	// wrap reads in a server-side BEGIN/COMMIT on that one shared connection and
+	// serialize (or deadlock) N concurrent readers. The gate keeps pool_size == 1
+	// byte-for-byte identical to the pre-pool behavior (primary, no transaction).
+	// Bare-quack / non-transactional callers also fall through to the primary.
+	optional_ptr<Transaction> transaction;
+	if (catalog.PoolSize() > 1 && context.transaction.HasActiveTransaction()) {
+		transaction = &Transaction::Get(context, catalog.GetAttached());
+	}
 	if (transaction) {
 		// Active transaction for this catalog: use its pinned pooled connection.
 		auto &quack_transaction = transaction->Cast<QuackTransaction>();
