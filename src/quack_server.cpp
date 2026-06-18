@@ -297,16 +297,26 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		auto &prepare_request_message = received_message.Cast<PrepareRequestMessage>();
 		auto &connection = *connection_p;
 
-		// TODO do not do this if there is no fun set
-		auto auth_result = EvaluateAuthQuery(
-		    db, StringUtil::Format("SELECT %s(?, ?)", GetSettingString(db, "quack_authorization_function")),
-		    Value(prepare_request_message.ConnectionId()), Value(prepare_request_message.Query()));
-		if (auth_result.IsNull() ||
-		    (auth_result.type().id() == LogicalTypeId::BOOLEAN && !auth_result.GetValue<bool>())) {
-			return make_uniq<ErrorResponse>("Authorization failed");
+		// Run the authorization callback only when a real authorizer is configured. The default
+		// (quack_nop_authorization, see quack_extension.cpp) is a pure pass-through that returns the
+		// query unchanged and always authorizes, so invoking it just burned a fresh Connection +
+		// parse/plan/execute on EVERY prepare — pure overhead that dominated latency for small
+		// queries. When it's the default, skip straight to the original SQL.
+		string effective_sql;
+		auto authorization_function = GetSettingString(db, "quack_authorization_function");
+		if (authorization_function == "quack_nop_authorization") {
+			effective_sql = prepare_request_message.Query();
+		} else {
+			auto auth_result =
+			    EvaluateAuthQuery(db, StringUtil::Format("SELECT %s(?, ?)", authorization_function),
+			                      Value(prepare_request_message.ConnectionId()), Value(prepare_request_message.Query()));
+			if (auth_result.IsNull() ||
+			    (auth_result.type().id() == LogicalTypeId::BOOLEAN && !auth_result.GetValue<bool>())) {
+				return make_uniq<ErrorResponse>("Authorization failed");
+			}
+			effective_sql = (auth_result.type().id() == LogicalTypeId::VARCHAR) ? auth_result.GetValue<string>()
+			                                                                    : prepare_request_message.Query();
 		}
-		auto effective_sql = (auth_result.type().id() == LogicalTypeId::VARCHAR) ? auth_result.GetValue<string>()
-		                                                                         : prepare_request_message.Query();
 
 		std::unique_lock<std::mutex> lock(connection.lock);
 		connection.duckdb_query_result.reset();
