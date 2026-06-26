@@ -9,9 +9,9 @@
 #
 #   (a) ORPHAN / in-transaction: a client BEGINs a transaction and writes, then is
 #       SIGKILLed WITHOUT sending a disconnect. After ttl+interval the server must
-#       roll back the orphaned transaction: the in-transaction session count drops to
-#       0 and a CHECKPOINT on the backing catalog succeeds (no "other write
-#       transactions active").
+#       roll back the orphaned transaction: the in-transaction session count drops to 0.
+#       (The CHECKPOINT-unblocking proof of the actual production symptom — which needs a
+#       DDL/catalog orphan, not an INSERT — lives in reaper_unblocks_checkpoint.sh.)
 #
 #   (b) NON-REAP: a plain-idle client (attached, no open transaction) left quiet past
 #       the ttl is NOT reaped — its next query still succeeds. Guards the deliberate
@@ -128,15 +128,13 @@ grep -q "INTXN_POST=0" "$SRV_LOG" \
   || fail "reaper did NOT clear the orphaned in-transaction session:\n$(grep INTXN_POST "$SRV_LOG")"
 echo "      orphaned in-transaction session reaped (1 -> 0)"
 
-# With the orphan transaction rolled back, a non-force CHECKPOINT on the backing catalog
-# must succeed (no "other write transactions active").
-printf "CHECKPOINT;\n" >&3
-printf "SELECT 'CKPT_POST_DONE=1';\n" >&3
-wait_for "CKPT_POST_DONE=1" "$SRV_LOG" 15 || fail "server did not finish post-reap checkpoint"
-if tail -n 8 "$SRV_LOG" | grep -qi "other write transactions active\|Cannot CHECKPOINT"; then
-  fail "CHECKPOINT blocked after reap — orphan txn was not rolled back:\n$(tail -n 8 "$SRV_LOG")"
-fi
-echo "      CHECKPOINT on the backing catalog succeeds"
+# NOTE: this test's orphan holds an INSERT (append), which takes only the *vacuum* lock,
+# NOT the shared checkpoint lock — so it never actually blocks CHECKPOINT regardless of
+# the reaper. The production symptom (CHECKPOINT failing with "other write transactions
+# active") requires an orphan holding a catalog/DDL operation, and the full
+# BLOCKED-before -> SUCCEEDS-after-reap proof lives in
+# test/integration/reaper_unblocks_checkpoint.sh. Here we only assert the reaper
+# mechanism itself: the orphaned in-transaction session is rolled back (1 -> 0 above).
 
 echo "[3/4] non-reap: the plain-idle client (idle past ttl) is still alive"
 printf "SELECT 'IDLE_SECOND=' || count(*) FROM r.t;\n" >&4

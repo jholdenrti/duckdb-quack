@@ -21,6 +21,10 @@ On a continuously-busy catalog (e.g. the Interface `__admin__` project, which th
 
 An orphaned write transaction pins the MVCC version horizon on the catalog. Every commit by the *live* connections then accumulates version history that can't be reclaimed, so memory climbs steadily until the process is killed. Because one quack server can host the metadata catalog that many clients depend on, an unbounded climb is a shared-blast-radius availability risk (OOM of the backing instance), not just wasted RAM.
 
+### Why `CHECKPOINT` fails (verified mechanism)
+
+DuckDB's manual `CHECKPOINT` throws *"there are other write transactions active"* only when another transaction holds the **shared checkpoint lock**. That lock is taken by `DuckTransaction::SetModifications` (`duckdb/src/transaction/duck_transaction.cpp:300`) for **catalog/DDL operations** — `Create`/`Drop`/`Alter` catalog entry, `Sequence`, `CreateIndex` — and for `UpdateData`. A plain row **append (`INSERT`) takes only the *vacuum* lock**, so an INSERT-only orphan never blocks `CHECKPOINT`. The production trigger was therefore an orphaned transaction holding a **catalog/DDL** lock — e.g. **a schema migration (`BEGIN; CREATE/ALTER …`) whose client died before `COMMIT`**. Under **ducklake every write is a catalog/metadata mutation**, so an orphaned ducklake *write* transaction holds the same lock — which is why the symptom showed up on ordinary writes, not only explicit DDL. End-to-end proof (orphan blocks `CHECKPOINT` → reaper rolls it back → `CHECKPOINT` recovers), plus the INSERT-doesn't-block contrast, is in `test/integration/reaper_unblocks_checkpoint.sh`.
+
 ## 2. Root cause (confirmed in source)
 
 The server keys a **persistent DuckDB connection** per logical client session:
