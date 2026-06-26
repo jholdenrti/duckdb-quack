@@ -12,6 +12,9 @@ struct QuackStartStopFunctionData : public TableFunctionData {
 	bool finished = false;
 	QuackUri listen_uri;
 	string token;
+	//! Idle-in-transaction reaper knobs (seconds). idle_in_transaction_timeout == 0 disables the reaper.
+	int64_t idle_in_transaction_timeout = 120;
+	int64_t reaper_sweep_interval = 30;
 };
 
 static unique_ptr<FunctionData> QuackServeBind(ClientContext &context, TableFunctionBindInput &input,
@@ -62,6 +65,22 @@ static unique_ptr<FunctionData> QuackServeBind(ClientContext &context, TableFunc
 	// thread is spawned, instead of leaving a half-built server behind.
 	QuackServer::ValidateToken(bind_data->token);
 
+	if (input.named_parameters.find("idle_in_transaction_timeout") != input.named_parameters.end()) {
+		auto requested = input.named_parameters["idle_in_transaction_timeout"].GetValue<int64_t>();
+		if (requested < 0) {
+			throw InvalidInputException("idle_in_transaction_timeout must be >= 0 (0 disables the reaper), got %lld",
+			                            (long long)requested);
+		}
+		bind_data->idle_in_transaction_timeout = requested;
+	}
+	if (input.named_parameters.find("reaper_sweep_interval") != input.named_parameters.end()) {
+		auto requested = input.named_parameters["reaper_sweep_interval"].GetValue<int64_t>();
+		if (requested < 1) {
+			throw InvalidInputException("reaper_sweep_interval must be >= 1, got %lld", (long long)requested);
+		}
+		bind_data->reaper_sweep_interval = requested;
+	}
+
 	return std::move(bind_data);
 }
 
@@ -71,7 +90,9 @@ static void QuackServe(ClientContext &context, TableFunctionInput &data_p, DataC
 		return;
 	}
 
-	QuackStorageExtensionInfo::GetState(*context.db).CreateServer(context, bind_data.listen_uri, bind_data.token);
+	QuackStorageExtensionInfo::GetState(*context.db).CreateServer(context, bind_data.listen_uri, bind_data.token,
+	                                                              bind_data.idle_in_transaction_timeout,
+	                                                              bind_data.reaper_sweep_interval);
 	output.SetValue(0, 0, bind_data.listen_uri.Uri());
 	output.SetValue(1, 0, bind_data.listen_uri.Http());
 	output.SetValue(2, 0, bind_data.token);
@@ -86,6 +107,8 @@ TableFunctionSet QuackServeFunction::GetFunction() {
 	fun.named_parameters["disable_ssl"] = LogicalType::BOOLEAN;
 	fun.named_parameters["allow_other_hostname"] = LogicalType::BOOLEAN;
 	fun.named_parameters["token"] = LogicalType::VARCHAR;
+	fun.named_parameters["idle_in_transaction_timeout"] = LogicalType::BIGINT;
+	fun.named_parameters["reaper_sweep_interval"] = LogicalType::BIGINT;
 	set.AddFunction(fun);
 	fun.arguments.clear();
 	set.AddFunction(fun);

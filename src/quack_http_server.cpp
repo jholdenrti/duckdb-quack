@@ -1,4 +1,5 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "quack_server.hpp"
 #include "quack_message.hpp"
@@ -23,6 +24,16 @@ void HttpQuackServer::Close() {
 	// listener's exit path inside httplib joins all workers, so a worker
 	// joining the listener would deadlock through that chain.
 	StopAccepting();
+	// Stop the reaper here (not in StopAccepting): joining a thread is unsafe from a
+	// worker, and Close() already carries the "not from a worker thread" contract.
+	{
+		std::lock_guard<std::mutex> lock(reaper_mutex);
+		reaper_stop = true;
+	}
+	reaper_cv.notify_all();
+	if (reaper_thread.joinable()) {
+		reaper_thread.join();
+	}
 	for (auto &thread : listen_threads) {
 		if (thread.joinable()) {
 			thread.join();
@@ -52,8 +63,28 @@ void HttpQuackServer::ListenThread(HttpQuackServer *server, const string &listen
 	}
 }
 
-HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p)
-    : QuackServer(context_p, uri_p, token_p) {
+void HttpQuackServer::ReaperThread(HttpQuackServer *server) {
+	std::unique_lock<std::mutex> lock(server->reaper_mutex);
+	while (!server->reaper_stop) {
+		// Interruptible sleep: woken early by Close()'s notify, otherwise every sweep interval.
+		server->reaper_cv.wait_for(lock, std::chrono::seconds(server->reaper_sweep_interval),
+		                           [server] { return server->reaper_stop; });
+		if (server->reaper_stop) {
+			break;
+		}
+		lock.unlock();
+		try {
+			server->ReapIdleConnections(Timestamp::GetCurrentTimestamp());
+		} catch (...) {
+			// Never let a sweep failure escape and terminate the process.
+		}
+		lock.lock();
+	}
+}
+
+HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p,
+                                 int64_t idle_in_transaction_timeout_p, int64_t reaper_sweep_interval_p)
+    : QuackServer(context_p, uri_p, token_p, idle_in_transaction_timeout_p, reaper_sweep_interval_p) {
 	server = make_uniq<duckdb_httplib::Server>();
 
 	// Each keep-alive connection holds a server thread for its lifetime.
@@ -108,6 +139,11 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 	}
 
 	listen_threads.push_back(std::thread(ListenThread, this, uri_p.Host(), uri_p.Port()));
+
+	// Start the idle-in-transaction reaper. idle_in_transaction_timeout == 0 disables it entirely.
+	if (idle_in_transaction_timeout > 0) {
+		reaper_thread = std::thread(ReaperThread, this);
+	}
 }
 
 } // namespace duckdb

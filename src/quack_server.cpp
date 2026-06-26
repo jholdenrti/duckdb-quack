@@ -1,6 +1,7 @@
 #include "duckdb/common/encryption_state.hpp"
 #include "duckdb/common/render_tree.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/interval.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -21,14 +22,22 @@ QuackConnection::QuackConnection(string session_id_p) : session_id(std::move(ses
 QuackConnection::~QuackConnection() {
 }
 
+bool QuackConnection::InTransaction() const {
+	return duckdb_connection && duckdb_connection->context &&
+	       duckdb_connection->context->transaction.HasActiveTransaction();
+}
+
 void QuackServer::ValidateToken(const string &token) {
 	if (token.size() < 4) {
 		throw InvalidInputException("Quack server token must be at least 4 characters long");
 	}
 }
 
-QuackServer::QuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p)
-    : db_ptr(context_p.db), uri(uri_p), token(token_p) {
+QuackServer::QuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p,
+                         int64_t idle_in_transaction_timeout_p, int64_t reaper_sweep_interval_p)
+    : idle_in_transaction_timeout(idle_in_transaction_timeout_p), reaper_sweep_interval(reaper_sweep_interval_p),
+      uri(uri_p), token(token_p) {
+	db_ptr = context_p.db;
 	ValidateToken(token);
 }
 
@@ -45,6 +54,12 @@ vector<QuackConnectionSnapshot> QuackServer::GetActiveConnectionSnap() {
 		snapshot.sql_query = conn->sql_query;
 		snapshot.query_state = conn->query_state;
 		snapshot.query_started_at = conn->query_started_at;
+		snapshot.last_activity = conn->last_activity;
+		// Only probe DuckDB transaction internals when no worker holds this connection
+		// (use_count()==1). A concurrent handler running SendQuery under conn->lock can be
+		// mutating current_transaction; reading it here (we hold only the map lock) would be a
+		// data race. This mirrors the reaper's safe-erase invariant.
+		snapshot.in_transaction = conn.use_count() == 1 && conn->InTransaction();
 		result.push_back(std::move(snapshot));
 	}
 	return result;
@@ -70,6 +85,7 @@ string QuackServer::CreateNewConnection(const string &session_id) {
 	}
 	auto new_connection = make_shared_ptr<QuackConnection>(session_id);
 	new_connection->duckdb_connection = make_uniq<Connection>(*db);
+	new_connection->last_activity = Timestamp::GetCurrentTimestamp();
 	new_connection->duckdb_connection->context->config.enable_progress_bar = false;
 	// new_connection->duckdb_connection->context->config.streaming_buffer_size = 10 * 1000000; // 10 MB
 	active_connections[session_id] = std::move(new_connection);
@@ -86,6 +102,48 @@ bool QuackServer::DisconnectConnection(const string &session_id) {
 	}
 	active_connections.erase(entry);
 	return true;
+}
+
+void QuackServer::ReapIdleConnections(timestamp_t now) {
+	if (idle_in_transaction_timeout <= 0) {
+		return; // reaper disabled
+	}
+	const int64_t ttl_us = idle_in_transaction_timeout * Interval::MICROS_PER_SEC;
+
+	// Collect the reaped connections and let them drop OUTSIDE the map lock, so that
+	// ~QuackConnection (DuckDB close + ROLLBACK) never runs while we hold active_connections_mutex.
+	vector<shared_ptr<QuackConnection>> reaped;
+
+	shared_ptr<DatabaseInstance> db = db_ptr.lock();
+	{
+		std::lock_guard<std::mutex> lock(active_connections_mutex);
+		for (auto it = active_connections.begin(); it != active_connections.end();) {
+			// Reference (do NOT copy) the shared_ptr while testing use_count() — a copy would make
+			// use_count() always >= 2 and the safe-erase invariant could never hold.
+			auto &conn = it->second;
+			const bool reapable = conn.use_count() == 1 && conn->query_state != QuackQueryState::ACTIVE &&
+			                      conn->InTransaction() && (now.value - conn->last_activity.value) > ttl_us;
+			if (!reapable) {
+				++it;
+				continue;
+			}
+
+			if (db) {
+				auto &logger = Logger::Get(*db);
+				if (logger.ShouldLog(QuackLogType::NAME, QuackLogType::LEVEL)) {
+					double idle_seconds = (double)(now.value - conn->last_activity.value) / Interval::MICROS_PER_SEC;
+					logger.WriteLog(QuackLogType::NAME, QuackLogType::LEVEL,
+					                StringUtil::Format("Reaping idle-in-transaction session %s (idle %.1fs, last "
+					                                   "query: %s)",
+					                                   conn->session_id, idle_seconds, conn->sql_query));
+				}
+			}
+
+			reaped.push_back(std::move(it->second));
+			it = active_connections.erase(it);
+		}
+	}
+	// reaped drops here: ~QuackConnection runs outside both the map lock and the connection's own lock.
 }
 
 static string GetSettingString(DatabaseInstance &db, const string &setting_name) {
@@ -221,6 +279,8 @@ unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream) {
 		if (!connection) {
 			return make_uniq<ErrorResponse>("Invalid connection id");
 		}
+		// Touch the session so the idle reaper sees it as live. Same clock the reaper uses.
+		connection->last_activity = Timestamp::GetCurrentTimestamp();
 	}
 
 	// now deserialize the actual message
@@ -228,6 +288,13 @@ unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream) {
 
 	// process the message
 	auto response = HandleMessageInternal(*db, *received_message, connection);
+
+	// Re-stamp activity at completion so the idle clock measures time since the last
+	// completed interaction, not since the request arrived — a long in-transaction
+	// statement must not shorten its own between-statement idle grace.
+	if (connection) {
+		connection->last_activity = Timestamp::GetCurrentTimestamp();
+	}
 
 	if (should_log) {
 		int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())

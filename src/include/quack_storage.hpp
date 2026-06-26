@@ -17,7 +17,8 @@ class QuackStorageExtensionInfo : public StorageExtensionInfo {
 public:
 	static QuackStorageExtensionInfo &GetState(const DatabaseInstance &instance);
 
-	QuackServer &CreateServer(ClientContext &context, const QuackUri &listen_uri, const string &token);
+	QuackServer &CreateServer(ClientContext &context, const QuackUri &listen_uri, const string &token,
+	                          int64_t idle_in_transaction_timeout = 120, int64_t reaper_sweep_interval = 30);
 	bool StopServer(ClientContext &context, const QuackUri &listen_uri);
 
 	struct ServerSnapshot {

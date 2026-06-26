@@ -1,6 +1,7 @@
 #pragma once
 
 #include <thread>
+#include <condition_variable>
 
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/shared_ptr.hpp"
@@ -26,6 +27,10 @@ struct QuackConnection {
 	explicit QuackConnection(string session_id_p);
 	~QuackConnection();
 
+	//! True iff the underlying DuckDB connection currently holds an open transaction.
+	//! Null-guarded; safe to call when the connection has not issued any query yet.
+	bool InTransaction() const;
+
 	mutex lock;
 	unique_ptr<Connection> duckdb_connection;
 	unique_ptr<QueryResult> duckdb_query_result;
@@ -37,6 +42,8 @@ struct QuackConnection {
 	string sql_query;
 	QuackQueryState query_state = QuackQueryState::IDLE;
 	timestamp_t query_started_at {0};
+	//! Wall-clock time the last message was handled for this session. Drives the idle reaper.
+	timestamp_t last_activity {0};
 };
 
 struct QuackConnectionSnapshot {
@@ -45,6 +52,8 @@ struct QuackConnectionSnapshot {
 	string sql_query;
 	QuackQueryState query_state = QuackQueryState::IDLE;
 	timestamp_t query_started_at {0};
+	timestamp_t last_activity {0};
+	bool in_transaction = false;
 };
 
 class QuackServer {
@@ -52,7 +61,8 @@ public:
 	static constexpr const idx_t QUACK_VERSION = 1;
 
 public:
-	explicit QuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p);
+	explicit QuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p,
+	                     int64_t idle_in_transaction_timeout_p = 120, int64_t reaper_sweep_interval_p = 30);
 	virtual ~QuackServer();
 
 	//! Stop accepting new connections (close the listener socket) without
@@ -69,7 +79,12 @@ public:
 	shared_ptr<QuackConnection> GetConnection(const string &connection_id);
 	string CreateNewConnection(const string &session_id);
 	bool DisconnectConnection(const string &session_id);
-	// TODO need something to destroy connections
+
+	//! Sweep active_connections and roll back orphaned idle-in-transaction sessions.
+	//! Reaps an entry only when it is the sole holder of its shared_ptr (use_count()==1),
+	//! is not running a query, holds an open transaction, and has been idle past the TTL.
+	//! `now` is injectable so the predicate is unit-testable against a synthetic clock.
+	void ReapIdleConnections(timestamp_t now);
 
 	string GenerateSessionId();
 
@@ -109,6 +124,10 @@ protected:
 	mutex session_id_rng_mutex;
 	shared_ptr<EncryptionState> session_id_rng;
 
+	//! Idle-in-transaction reaper config (seconds). idle_in_transaction_timeout == 0 disables the reaper.
+	int64_t idle_in_transaction_timeout;
+	int64_t reaper_sweep_interval;
+
 private:
 	QuackUri uri;
 	string token;
@@ -116,7 +135,8 @@ private:
 
 class HttpQuackServer : public QuackServer {
 public:
-	HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p);
+	HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p,
+	                int64_t idle_in_transaction_timeout_p = 120, int64_t reaper_sweep_interval_p = 30);
 
 	void StopAccepting() override;
 	void Close() override;
@@ -126,10 +146,18 @@ public:
 private:
 	static void ListenThread(HttpQuackServer *server, const string &listen_host, int listen_port);
 
+	//! Background reaper: interruptible sleep of reaper_sweep_interval, then ReapIdleConnections(now).
+	static void ReaperThread(HttpQuackServer *server);
+
 	unique_ptr<QuackMessage> ReadMessage(MemoryStream &read_stream);
 
 	unique_ptr<duckdb_httplib::Server> server;
 	bool is_running = false;
+
+	std::thread reaper_thread;
+	std::mutex reaper_mutex;
+	std::condition_variable reaper_cv;
+	bool reaper_stop = false;
 };
 
 } // namespace duckdb

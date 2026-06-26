@@ -1,6 +1,6 @@
 # Spec: Idle / orphaned-connection reaper for `quack_serve`
 
-**Status:** Proposed
+**Status:** Implemented (in-transaction only)
 **Target release:** the DuckDB **1.5.4** bump (carrier release — the extension rebuild + coordinated quackd/API roll is already being paid for)
 **Owner:** TBD
 **Branch:** `feat/idle-connection-reaper`
@@ -148,6 +148,6 @@ so operators can see an idle-in-transaction connection directly instead of infer
 
 ## 8. Open questions
 
-- Reap plain-idle (no-transaction) connections too, or only idle-in-transaction? (Leaning: reap both, with a larger TTL for plain-idle, to also bound map growth.)
+- **Resolved — idle-in-transaction only.** The shipped reaper reaps **only** connections holding an open transaction; plain-idle (no-transaction) connections are intentionally **never** reaped. Reaping a healthy plain-idle session would break that client: its next request returns `ErrorResponse("Invalid connection id")` (`src/quack_server.cpp:222`), the client's `Request<>` throws immediately on any error (`src/include/quack_client.hpp:25-26`), and there is no reconnect/retry path (`src/storage/quack_transaction.cpp:88-96` only marks the connection dirty and rethrows). Only an orphaned *transaction* actually leaks (it pins the MVCC version horizon), so that is the only thing worth the risk of reaping. Config: `quack_serve(idle_in_transaction_timeout := 120, reaper_sweep_interval := 30)`; `idle_in_transaction_timeout = 0` disables the reaper.
 - Expose a counter metric (`quack_reaped_connections_total`) for alerting on a high reap rate (a signal that clients are dying mid-transaction — i.e. the *upstream* bug, e.g. API OOMKills, is still happening)?
 - Should the reaper also fire on `StopAccepting()` (drain) to roll back orphans before a planned instance stop, or is destructor teardown sufficient?

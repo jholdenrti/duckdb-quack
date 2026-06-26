@@ -1,0 +1,72 @@
+# name: test/sql/idle_reaper.test
+# description: idle-in-transaction reaper config knobs + quack_active_connections observability columns
+# group: [sql]
+
+require quack
+
+require httpfs
+
+set ignore_error_messages __none__
+
+# quack_serve accepts the reaper knobs
+statement ok con1
+call quack_serve('quack:localhost', token='asdf', idle_in_transaction_timeout=120, reaper_sweep_interval=30);
+
+statement ok con1
+call quack_stop('quack:localhost');
+
+# idle_in_transaction_timeout=0 is accepted (reaper disabled)
+statement ok con1
+call quack_serve('quack:localhost', token='asdf', idle_in_transaction_timeout=0);
+
+statement ok con1
+call quack_stop('quack:localhost');
+
+# negative timeout is rejected
+statement error con1
+call quack_serve('quack:localhost', token='asdf', idle_in_transaction_timeout=-1);
+----
+idle_in_transaction_timeout must be >= 0
+
+# reaper_sweep_interval must be >= 1
+statement error con1
+call quack_serve('quack:localhost', token='asdf', reaper_sweep_interval=0);
+----
+reaper_sweep_interval must be >= 1
+
+# Observability columns are exposed with sane values for a plain (non-transactional) client.
+statement ok con1
+call quack_serve('quack:localhost', token='asdf');
+
+statement ok con1
+create table fuu as values(42, 43);
+
+statement ok con2
+attach 'quack:localhost' as rpc2 (token 'asdf');
+
+query II con2
+from rpc2.fuu;
+----
+42	43
+
+# The new columns exist; a plain SELECT client is not in a transaction and has a defined idle_seconds.
+query I con1
+select in_transaction from quack_active_connections();
+----
+false
+
+query I con1
+select idle_seconds >= 0 from quack_active_connections();
+----
+true
+
+query I con1
+select last_activity is not null from quack_active_connections();
+----
+true
+
+statement ok con2
+detach rpc2;
+
+statement ok con1
+call quack_stop('quack:localhost');
