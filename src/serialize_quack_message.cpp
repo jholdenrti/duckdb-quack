@@ -65,11 +65,22 @@ unique_ptr<DisconnectMessage> DisconnectMessage::Deserialize(Deserializer &deser
 
 void ErrorResponse::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "message", error.RawMessage());
+	serializer.WritePropertyWithDefault<string>(2, "exception_type", Exception::ExceptionTypeToString(error.Type()),
+	                                            Exception::ExceptionTypeToString(ExceptionType::INVALID_INPUT));
 }
 
 unique_ptr<ErrorResponse> ErrorResponse::Deserialize(Deserializer &deserializer) {
 	auto message = deserializer.ReadPropertyWithDefault<string>(1, "message");
-	auto result = duckdb::unique_ptr<ErrorResponse>(new ErrorResponse(std::move(message)));
+	auto exception_type = deserializer.ReadPropertyWithExplicitDefault<string>(
+	    2, "exception_type", Exception::ExceptionTypeToString(ExceptionType::INVALID_INPUT));
+	// Rebuild the error with the exception type it had on the sending side. Preserving the type
+	// matters: DuckDB only invalidates the receiving transaction for some exception types
+	// (e.g. INVALID_INPUT) but not others (e.g. BINDER/CATALOG), so collapsing every remote error
+	// to INVALID_INPUT would abort client transactions on benign errors such as table-existence
+	// probes. Note: construct the ErrorData explicitly - a two-string ErrorResponse constructor
+	// would be captured by the variadic format-string constructor and lose the type again.
+	auto result = duckdb::unique_ptr<ErrorResponse>(
+	    new ErrorResponse(ErrorData(Exception::StringToExceptionType(exception_type), std::move(message))));
 	return result;
 }
 

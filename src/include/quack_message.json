@@ -26,12 +26,20 @@
   },
   {
     "class": "ErrorResponse",
+    "custom_implementation": true,
     "members": [
       {
         "id": 1,
         "name": "message",
         "type": "string",
         "serialize_property": "error.RawMessage()"
+      },
+      {
+        "id": 2,
+        "name": "exception_type",
+        "type": "string",
+        "serialize_property": "Exception::ExceptionTypeToString(error.Type())",
+        "default": "Exception::ExceptionTypeToString(ExceptionType::INVALID_INPUT)"
       }
     ],
     "constructor": ["message"]
