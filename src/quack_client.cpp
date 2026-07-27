@@ -76,14 +76,6 @@ unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientCo
 		LoadExtraHttpHeaders(context, db, uri, extra_headers);
 	}
 	http_params->timeout = HTTP_TIMEOUT_SECONDS;
-	// No retries, and do not add any: every quack RPC is a POST that may already have been
-	// applied by the time a failure is visible, so a replay can double-apply an APPEND or -
-	// because the server advances its cursor per FETCH - hand back the *next* batch and
-	// silently drop rows. The case a retry would otherwise be wanted for, `http_client`
-	// holding a keep-alive socket the peer closed while idle, never reaches this layer:
-	// cpp-httplib checks is_socket_alive() before sending and reconnects transparently
-	// (third_party/httplib/httplib.hpp, ClientImpl::send_). A failure that does surface here
-	// is a real connection error, and re-sending it would not help.
 	http_params->retries = 0;
 
 	HTTPHeaders headers = extra_headers;
