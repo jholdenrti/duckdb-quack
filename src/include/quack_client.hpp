@@ -104,6 +104,8 @@ private:
 
 class HttpsQuackClient : public QuackClient {
 public:
+	static constexpr uint64_t HTTP_TIMEOUT_SECONDS = 86400;
+
 	HttpsQuackClient(DatabaseInstance &db, const QuackUri &uri_p);
 	~HttpsQuackClient() override;
 
@@ -113,6 +115,9 @@ private:
 
 private:
 	unique_ptr<HTTPParams> http_params;
+	//! Extra HTTP headers resolved once from the `quack` secret (EXTRA_HTTP_HEADERS),
+	//! injected into every request. Loaded lazily alongside http_params.
+	HTTPHeaders extra_headers;
 	// Persistent keep-alive client to quackd, reused across every RPC this client
 	// issues. Passing it to the two-arg HTTPUtil::Request makes SendRequest lazily
 	// initialize it once and reuse the underlying connection; the one-arg overload

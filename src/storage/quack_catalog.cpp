@@ -207,22 +207,21 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientCont
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
 	}
-	// The first PREPARE batch only carries up to quack_fetch_batch_chunks chunks. If the result is
-	// larger, keep issuing FETCH on the same connection/result until the server returns an empty
-	// batch (mirrors the data-path loop in QuackScan). Without this, catalog loads silently
-	// truncate above ~one batch of rows (~24k by default), dropping tables/schemas.
-	if (response->NeedsMoreFetch()) {
-		auto result_uuid = response->ResultUUID();
-		while (true) {
-			auto fetch_response = client.Request<FetchResponseMessage>(
-			    context, make_uniq<FetchRequestMessage>(conn.ConnectionId(), result_uuid));
-			if (fetch_response->MutableResults().empty()) {
-				// server is done
-				break;
-			}
-			for (auto &chunk : fetch_response->MutableResults()) {
-				chunk_collection->Append(chunk->Chunk());
-			}
+	// The PREPARE response only carries the first batch (at most quack_fetch_batch_chunks chunks).
+	// These commands load the catalog, so anything left behind is not a truncated result set - it
+	// is a schema, table or view that silently ceases to exist. Drain the rest.
+	auto result_uuid = response->ResultUUID();
+	auto needs_more_fetch = response->NeedsMoreFetch();
+	while (needs_more_fetch) {
+		auto fetch_response = client.Request<FetchResponseMessage>(
+		    context, make_uniq<FetchRequestMessage>(conn.ConnectionId(), result_uuid));
+		if (fetch_response->MutableResults().empty()) {
+			// an empty FETCH is how the server says the result is exhausted (cf. QuackScan)
+			needs_more_fetch = false;
+			break;
+		}
+		for (auto &chunk : fetch_response->MutableResults()) {
+			chunk_collection->Append(chunk->Chunk());
 		}
 	}
 	return chunk_collection;
