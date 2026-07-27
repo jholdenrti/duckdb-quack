@@ -1,0 +1,62 @@
+# name: test/sql/keepalive_reconnect.test_slow
+# description: an RPC on a keep-alive socket the server closed while idle transparently reconnects
+# group: [sql]
+
+require quack
+
+require httpfs
+
+statement ok con1
+call quack_serve('quack:localhost:20411', token='ka_tok');
+
+statement ok con2
+create secret quack_ka (type quack, token 'ka_tok', scope 'quack:localhost:20411')
+
+statement ok con2
+attach 'quack:localhost:20411' as ka (type quack)
+
+# Establishes the persistent keep-alive client on the attached catalog's connection.
+query II con2
+from ka.query('select 1, 2')
+----
+1	2
+
+# The server sets set_keep_alive_timeout(10), so sitting idle past that makes it close the
+# TCP connection while the quack session survives - the session is keyed by connection_id
+# carried in the message, not by the socket. The next RPC therefore goes out on a socket the
+# peer has closed.
+#
+# Recovery comes from cpp-httplib, which checks is_socket_alive() before sending and
+# reconnects (ClientImpl::send_); it never reaches DuckDB's retry layer, which is why quack
+# can run with http_params->retries = 0 and no retry loop of its own. This test pins that
+# down: it fails if the persistent http_client stops self-healing, at which point the fix is
+# to reconnect explicitly, NOT to enable retries (replaying a POST can double-apply an APPEND
+# or skip a FETCH batch).
+sleep 12 second
+
+query II con2
+from ka.query('select 3, 4')
+----
+3	4
+
+# The recovered connection is still the same quack session, so catalog state set up before
+# the socket died is still there.
+statement ok con2
+create table ka.survives(i integer)
+
+statement ok con2
+insert into ka.survives values (42)
+
+query I con2
+select i from ka.survives
+----
+42
+
+statement ok con2
+detach ka
+
+statement ok con2
+drop secret quack_ka
+
+statement ok con1
+call quack_stop('quack:localhost:20411')
