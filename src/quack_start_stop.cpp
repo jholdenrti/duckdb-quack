@@ -55,14 +55,14 @@ static unique_ptr<FunctionData> QuackServeBind(ClientContext &context, TableFunc
 
 	// Every server has a token, resolved in priority order:
 	//   1. a user-supplied `token` parameter,
-	//   2. the token of a quack secret matching this endpoint,
+	//   2. the token of a quack secret scoped to this endpoint,
 	//   3. a freshly generated random token.
 	// The authn callback (default token-check or a user-defined function) decides
 	// what to do with it; the server itself doesn't care which path is in use.
 	if (input.named_parameters.find("token") != input.named_parameters.end()) {
 		bind_data->token = input.named_parameters["token"].GetValue<string>();
 	} else {
-		bind_data->token = QuackServer::TokenFromSecret(context, bind_data->listen_uri);
+		bind_data->token = QuackServer::ListenTokenFromSecret(context, bind_data->listen_uri);
 		if (bind_data->token.empty()) {
 			bind_data->token = QuackServer::GenerateRandomToken(*context.db);
 		}

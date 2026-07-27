@@ -13,6 +13,9 @@
 namespace duckdb {
 
 class ClientContext;
+class SecretManager;
+struct SecretMatch;
+struct CatalogTransaction;
 class QuackMessage;
 class Connection;
 class MemoryStream;
@@ -94,10 +97,27 @@ public:
 	//! Throw InvalidInputException if `token` doesn't meet requirements(currently, length >= 4)
 	static void ValidateToken(const string &token);
 
+	//! The scope a quack secret gets when the user doesn't specify one. It prefix-matches
+	//! every quack URI, so a secret carrying it says nothing about which endpoint it is for.
+	static constexpr const char *DEFAULT_SECRET_SCOPE = "quack:";
+
+	//! Look up the quack secret matching `uri`. Takes a transaction and secret manager
+	//! rather than a ClientContext so it also serves the context-free request path.
+	//! Scopes are matched as plain string prefixes, so the canonical form is tried first
+	//! and the raw spelling second - see the definition for why both are needed.
+	static SecretMatch LookupSecret(CatalogTransaction transaction, SecretManager &secret_manager,
+	                                const QuackUri &uri);
+
 	//! Look up a quack secret matching `uri` and return its token, or an empty
 	//! string when no secret matches. Lets a token be sourced from the secret
 	//! manager when the caller didn't supply one explicitly.
 	static string TokenFromSecret(ClientContext &context, const QuackUri &uri);
+
+	//! As TokenFromSecret, but for the token a *server* listens with. Ignores a secret
+	//! carrying only the catch-all DEFAULT_SECRET_SCOPE: such a secret was written to
+	//! reach some other endpoint, and silently reusing it as this listener's token would
+	//! grant its holders access to the new server.
+	static string ListenTokenFromSecret(ClientContext &context, const QuackUri &uri);
 
 	vector<QuackConnectionSnapshot> GetActiveConnectionSnap();
 

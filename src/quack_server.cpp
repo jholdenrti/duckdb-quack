@@ -42,17 +42,55 @@ QuackServer::QuackServer(ClientContext &context_p, const QuackUri &uri_p, const 
 	ValidateToken(token);
 }
 
-string QuackServer::TokenFromSecret(ClientContext &context, const QuackUri &uri) {
-	auto &secret_manager = SecretManager::Get(context);
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	// Look up by the canonical form: secret scopes are matched as plain string prefixes, so
-	// `uri.Uri()` would make the match depend on how the endpoint was spelled.
+SecretMatch QuackServer::LookupSecret(CatalogTransaction transaction, SecretManager &secret_manager,
+                                      const QuackUri &uri) {
+	// Prefer the canonical form (`quack:host:port`): scopes are matched as plain string
+	// prefixes, so looking up the raw string would make the match depend on how the endpoint
+	// happened to be spelled - `quack:host` and `quack:host:9494` are the same server.
 	auto match = secret_manager.LookupSecret(transaction, uri.CanonicalUri(), "quack");
+	if (match.HasMatch()) {
+		return match;
+	}
+	// Fall back to the raw spelling. Canonicalisation collapses `quack://host:port` (a form
+	// QuackUri deliberately accepts, see quack_uri.cpp) to `quack:host:port`, which does not
+	// start with a scope written as `quack://host:port` - without this fallback such secrets
+	// would stop resolving.
+	return secret_manager.LookupSecret(transaction, uri.Uri(), "quack");
+}
+
+string QuackServer::TokenFromSecret(ClientContext &context, const QuackUri &uri) {
+	auto match = LookupSecret(CatalogTransaction::GetSystemCatalogTransaction(context), SecretManager::Get(context),
+	                          uri);
 	if (match.HasMatch()) {
 		const auto &kv = dynamic_cast<const KeyValueSecret &>(*match.secret_entry->secret);
 		return kv.TryGetValue("token", true).ToString();
 	}
 	return "";
+}
+
+string QuackServer::ListenTokenFromSecret(ClientContext &context, const QuackUri &uri) {
+	auto match = LookupSecret(CatalogTransaction::GetSystemCatalogTransaction(context), SecretManager::Get(context),
+	                          uri);
+	if (!match.HasMatch()) {
+		return "";
+	}
+	// A secret whose every scope is the catch-all matches this URI only because it matches
+	// all of them; it carries no evidence of being meant for the endpoint we are about to
+	// listen on. Adopting its token would hand everyone holding that (typically outbound,
+	// remote) token access to this server.
+	const auto &scope = match.secret_entry->secret->GetScope();
+	bool scoped_to_endpoint = false;
+	for (const auto &prefix : scope) {
+		if (prefix != DEFAULT_SECRET_SCOPE) {
+			scoped_to_endpoint = true;
+			break;
+		}
+	}
+	if (!scoped_to_endpoint) {
+		return "";
+	}
+	const auto &kv = dynamic_cast<const KeyValueSecret &>(*match.secret_entry->secret);
+	return kv.TryGetValue("token", true).ToString();
 }
 
 QuackServer::~QuackServer() {

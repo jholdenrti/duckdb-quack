@@ -33,7 +33,9 @@ static constexpr const char *QUACK_SECRET_TYPE = "quack";
 static unique_ptr<BaseSecret> CreateQuackSecretFromConfig(ClientContext &, CreateSecretInput &input) {
 	auto scope = input.scope;
 	if (scope.empty()) {
-		scope.emplace_back("quack:");
+		// Catch-all. QuackServer::ListenTokenFromSecret keys off this exact value to tell an
+		// endpoint-scoped secret from one that merely matches everything - keep them in sync.
+		scope.emplace_back(QuackServer::DEFAULT_SECRET_SCOPE);
 	}
 	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
 	for (const auto &named_param : input.options) {
@@ -47,7 +49,9 @@ static unique_ptr<BaseSecret> CreateQuackSecretFromConfig(ClientContext &, Creat
 			throw InvalidInputException("Unknown named parameter for quack secret: %s", lower_name);
 		}
 	}
-	secret->redact_keys = {"token"};
+	// extra_http_headers exists to carry credentials to a reverse proxy (e.g. an Authorization
+	// bearer), so it needs the same redaction in duckdb_secrets() that the token gets.
+	secret->redact_keys = {"token", "extra_http_headers"};
 	return std::move(secret);
 }
 

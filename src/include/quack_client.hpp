@@ -105,6 +105,13 @@ private:
 class HttpsQuackClient : public QuackClient {
 public:
 	static constexpr uint64_t HTTP_TIMEOUT_SECONDS = 86400;
+	//! Quack pins its own retry count rather than inheriting httpfs's `http_retries`, for the
+	//! same reason it pins the timeout. It must stay non-zero: `http_client` below is a
+	//! persistent keep-alive client, and DuckDB rebuilds it only from the retry callback
+	//! (HTTPUtil::Request's `on_retry`), which never fires at retries=0. Without a retry the
+	//! first RPC after quackd or a proxy drops an idle connection surfaces as a hard
+	//! IOException instead of transparently reconnecting.
+	static constexpr uint64_t HTTP_RETRIES = 3;
 
 	HttpsQuackClient(DatabaseInstance &db, const QuackUri &uri_p);
 	~HttpsQuackClient() override;

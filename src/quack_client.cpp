@@ -22,9 +22,17 @@ string GetUriPart(T ele) {
 static void LoadExtraHttpHeaders(optional_ptr<ClientContext> context, DatabaseInstance &db, const QuackUri &uri,
                                  HTTPHeaders &headers) {
 	auto &secret_manager = SecretManager::Get(db);
-	auto transaction = context ? CatalogTransaction::GetSystemCatalogTransaction(*context)
-	                           : CatalogTransaction::GetSystemTransaction(db);
-	auto match = secret_manager.LookupSecret(transaction, uri.Uri(), "quack");
+	// GetSystemCatalogTransaction reaches TransactionContext::ActiveTransaction(), which throws
+	// an InternalException when no transaction is installed. A live context is not enough: this
+	// runs from COMMIT too, where TransactionContext::Commit() has already cleared the
+	// transaction before handing off to us. Fall back to the instance-level transaction there,
+	// exactly as the InitializeParameters call in RequestInternal does.
+	auto transaction = context && context->transaction.HasActiveTransaction()
+	                       ? CatalogTransaction::GetSystemCatalogTransaction(*context)
+	                       : CatalogTransaction::GetSystemTransaction(db);
+	// Resolve through the same helper the token uses, so one secret cannot supply the token
+	// while silently failing to supply the headers that go with it.
+	auto match = QuackServer::LookupSecret(transaction, secret_manager, uri);
 	if (!match.HasMatch()) {
 		return;
 	}
@@ -68,7 +76,7 @@ unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientCo
 		LoadExtraHttpHeaders(context, db, uri, extra_headers);
 	}
 	http_params->timeout = HTTP_TIMEOUT_SECONDS;
-	http_params->retries = 0;
+	http_params->retries = HTTP_RETRIES;
 
 	HTTPHeaders headers = extra_headers;
 
