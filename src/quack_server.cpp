@@ -272,6 +272,7 @@ string QuackServer::GenerateRandomToken(DatabaseInstance &db) {
 }
 
 string QuackServer::GenerateSessionId() {
+	data_t bytes[kTokenBytes];
 	{
 		std::lock_guard<std::mutex> lock(session_id_rng_mutex);
 		if (!session_id_rng) {
@@ -284,10 +285,9 @@ string QuackServer::GenerateSessionId() {
 			                                                   EncryptionTypes::EncryptionVersion::NONE);
 			session_id_rng = encryption_util->CreateEncryptionState(std::move(metadata));
 		}
+		// Generate under the mutex: the RNG state is shared across concurrent CONNECTION_REQUESTs.
+		session_id_rng->GenerateRandomData(bytes, kTokenBytes);
 	}
-
-	data_t bytes[kTokenBytes];
-	session_id_rng->GenerateRandomData(bytes, kTokenBytes);
 	return HexEncode(bytes, kTokenBytes);
 }
 
@@ -496,8 +496,12 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			                                                                    : prepare_request_message.Query();
 		}
 
+		// Declared before `lock` so it is destroyed after the lock releases: tearing down the
+		// previous query's streaming result can block on its in-flight I/O, and must not do so
+		// while holding the session lock.
+		unique_ptr<QueryResult> stale_result;
 		std::unique_lock<std::mutex> lock(connection.lock);
-		connection.duckdb_query_result.reset();
+		stale_result = std::move(connection.duckdb_query_result);
 		connection.StartQuery(prepare_request_message.Query());
 
 		{
