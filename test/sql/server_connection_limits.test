@@ -1,0 +1,71 @@
+# name: test/sql/server_connection_limits.test
+# description: quack_server_max_connections sheds excess connections cleanly; idle sockets closed by quack_server_keep_alive_timeout self-heal on the client.
+# group: [sql]
+
+require quack
+
+require httpfs
+
+set ignore_error_messages
+
+# Server with a hard cap of 1 concurrent connection and a 1-second keep-alive, so both
+# limits are exercised quickly. Settings must be in place before quack_serve reads them.
+statement ok con1
+SET quack_server_max_connections=1;
+
+statement ok con1
+SET quack_server_keep_alive_timeout=1;
+
+statement ok con1
+call quack_serve('quack:localhost:20511', token='asdf');
+
+# Keep the client single-threaded so one cached connection carries the whole session.
+statement ok con2
+SET threads=1;
+
+# A single client fits in the 1-connection budget: attach, write, read.
+statement ok con2
+ATTACH 'quack:localhost:20511' AS rpc1 (TYPE quack, TOKEN 'asdf');
+
+statement ok con2
+CREATE TABLE rpc1.t1 AS SELECT range AS i FROM range(100);
+
+query I con2
+SELECT count(*) FROM rpc1.t1;
+----
+100
+
+# The cap is taken by rpc1's cached connection: a second attach is shed (socket closed by
+# the server), surfacing as a request error — not a hang.
+statement error con2
+ATTACH 'quack:localhost:20511' AS rpc2 (TYPE quack, TOKEN 'asdf');
+----
+Failed to send message
+
+# Detaching releases rpc1's sockets, freeing the connection slot for a new client.
+statement ok con2
+DETACH rpc1;
+
+statement ok con2
+ATTACH 'quack:localhost:20511' AS rpc2 (TYPE quack, TOKEN 'asdf');
+
+query I con2
+SELECT count(*) FROM rpc2.t1;
+----
+100
+
+# Idle past the server keep-alive: the server closes the socket. The client's cached
+# connection is now stale and must self-heal (httplib reconnects on a fresh socket before
+# sending; see keepalive_reconnect.test_slow) transparently.
+sleep 2 seconds
+
+query I con2
+SELECT count(*) FROM rpc2.t1;
+----
+100
+
+statement ok con2
+DETACH rpc2;
+
+statement ok con1
+call quack_stop('quack:localhost:20511');

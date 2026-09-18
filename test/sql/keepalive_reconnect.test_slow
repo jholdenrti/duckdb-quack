@@ -6,6 +6,11 @@ require quack
 
 require httpfs
 
+# The server-side idle close defaults to 300 s (quack_server_keep_alive_timeout); shorten it
+# so the test can wait it out. Must be set before quack_serve reads it.
+statement ok con1
+SET quack_server_keep_alive_timeout=10;
+
 statement ok con1
 call quack_serve('quack:localhost:20411', token='ka_tok');
 
@@ -21,7 +26,7 @@ from ka.query('select 1, 2')
 ----
 1	2
 
-# The server sets set_keep_alive_timeout(10), so sitting idle past that makes it close the
+# The server's keep-alive timeout is 10 s here, so sitting idle past that makes it close the
 # TCP connection while the quack session survives - the session is keyed by connection_id
 # carried in the message, not by the socket. The next RPC therefore goes out on a socket the
 # peer has closed.
