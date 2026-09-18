@@ -29,6 +29,21 @@ bool QuackConnection::InTransaction() const {
 	       duckdb_connection->context->transaction.HasActiveTransaction();
 }
 
+void QuackConnection::StartQuery(const string &sql) {
+	lock_guard<mutex> state_guard(state_lock);
+	sql_query = sql;
+	query_state = QuackQueryState::ACTIVE;
+	query_started_at = Timestamp::GetCurrentTimestamp();
+}
+
+void QuackConnection::SetQueryState(QuackQueryState state, bool clear_sql) {
+	lock_guard<mutex> state_guard(state_lock);
+	query_state = state;
+	if (clear_sql) {
+		sql_query = "";
+	}
+}
+
 void QuackServer::ValidateToken(const string &token) {
 	if (token.size() < 4) {
 		throw InvalidInputException("Quack server token must be at least 4 characters long");
@@ -104,10 +119,19 @@ vector<QuackConnectionSnapshot> QuackServer::GetActiveConnectionSnap() {
 		auto &conn = conn_kv.second;
 		QuackConnectionSnapshot snapshot;
 		snapshot.session_id = conn->session_id;
-		snapshot.sql_query = conn->sql_query;
-		snapshot.query_state = conn->query_state;
-		snapshot.query_started_at = conn->query_started_at;
-		snapshot.last_activity = conn->last_activity;
+		snapshot.last_activity = timestamp_t(conn->last_activity.load());
+		{
+			// sql_query, query_state and query_started_at are written by handlers under conn->lock, so
+			// reading them with only the map lock is a data race (sql_query is a std::string: a concurrent
+			// PREPARE can free the storage we copy). We cannot take conn->lock here either: called over
+			// RPC, this runs inside a PREPARE handler that already holds its own session's conn->lock, and
+			// two such concurrent snapshots would wait on each other's session. Writers therefore also
+			// hold state_lock, a leaf lock never held across a query, and we read under that.
+			std::lock_guard<std::mutex> state_guard(conn->state_lock);
+			snapshot.sql_query = conn->sql_query;
+			snapshot.query_state = conn->query_state;
+			snapshot.query_started_at = conn->query_started_at;
+		}
 		// Only probe DuckDB transaction internals when no worker holds this connection
 		// (use_count()==1). A concurrent handler running SendQuery under conn->lock can be
 		// mutating current_transaction; reading it here (we hold only the map lock) would be a
@@ -138,7 +162,7 @@ string QuackServer::CreateNewConnection(const string &session_id) {
 	}
 	auto new_connection = make_shared_ptr<QuackConnection>(session_id);
 	new_connection->duckdb_connection = make_uniq<Connection>(*db);
-	new_connection->last_activity = Timestamp::GetCurrentTimestamp();
+	new_connection->last_activity = Timestamp::GetCurrentTimestamp().value;
 	new_connection->duckdb_connection->context->config.enable_progress_bar = false;
 	// new_connection->duckdb_connection->context->config.streaming_buffer_size = 10 * 1000000; // 10 MB
 	active_connections[session_id] = std::move(new_connection);
@@ -175,7 +199,7 @@ void QuackServer::ReapIdleConnections(timestamp_t now) {
 			// use_count() always >= 2 and the safe-erase invariant could never hold.
 			auto &conn = it->second;
 			const bool reapable = conn.use_count() == 1 && conn->query_state != QuackQueryState::ACTIVE &&
-			                      conn->InTransaction() && (now.value - conn->last_activity.value) > ttl_us;
+			                      conn->InTransaction() && (now.value - conn->last_activity.load()) > ttl_us;
 			if (!reapable) {
 				++it;
 				continue;
@@ -184,7 +208,7 @@ void QuackServer::ReapIdleConnections(timestamp_t now) {
 			if (db) {
 				auto &logger = Logger::Get(*db);
 				if (logger.ShouldLog(QuackLogType::NAME, QuackLogType::LEVEL)) {
-					double idle_seconds = (double)(now.value - conn->last_activity.value) / Interval::MICROS_PER_SEC;
+					double idle_seconds = (double)(now.value - conn->last_activity.load()) / Interval::MICROS_PER_SEC;
 					logger.WriteLog(QuackLogType::NAME, QuackLogType::LEVEL,
 					                StringUtil::Format("Reaping idle-in-transaction session %s (idle %.1fs, last "
 					                                   "query: %s)",
@@ -361,7 +385,7 @@ unique_ptr<QuackMessage> QuackServer::DispatchMessage(MemoryStream &read_stream)
 			return make_uniq<ErrorResponse>("Invalid connection id");
 		}
 		// Touch the session so the idle reaper sees it as live. Same clock the reaper uses.
-		connection->last_activity = Timestamp::GetCurrentTimestamp();
+		connection->last_activity = Timestamp::GetCurrentTimestamp().value;
 	}
 
 	// now deserialize the actual message
@@ -380,7 +404,7 @@ unique_ptr<QuackMessage> QuackServer::DispatchMessage(MemoryStream &read_stream)
 	// completed interaction, not since the request arrived — a long in-transaction
 	// statement must not shorten its own between-statement idle grace.
 	if (connection) {
-		connection->last_activity = Timestamp::GetCurrentTimestamp();
+		connection->last_activity = Timestamp::GetCurrentTimestamp().value;
 	}
 
 	if (should_log) {
@@ -474,21 +498,17 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 
 		std::unique_lock<std::mutex> lock(connection.lock);
 		connection.duckdb_query_result.reset();
-		connection.sql_query = prepare_request_message.Query();
-		connection.query_state = QuackQueryState::ACTIVE;
-		connection.query_started_at = Timestamp::GetCurrentTimestamp();
+		connection.StartQuery(prepare_request_message.Query());
 
 		{
 			auto query_result = connection.duckdb_connection->SendQuery(effective_sql);
 			if (query_result->HasError()) {
 				// TODO; instead of cancelled, add an ERROR state
-				connection.query_state = QuackQueryState::CANCELLED;
-				connection.sql_query = "";
+				connection.SetQueryState(QuackQueryState::CANCELLED, true);
 				return make_uniq<ErrorResponse>(query_result->GetErrorObject());
 			}
 			if (query_result->names.empty()) {
-				connection.query_state = QuackQueryState::CANCELLED;
-				connection.sql_query = "";
+				connection.SetQueryState(QuackQueryState::CANCELLED, true);
 				return make_uniq<ErrorResponse>("Query did not return any columns");
 			}
 
@@ -517,7 +537,7 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		}
 		auto needs_more_fetch = results.size() == max_chunks_per_batch;
 		if (!needs_more_fetch) {
-			connection.query_state = QuackQueryState::FINISHED;
+			connection.SetQueryState(QuackQueryState::FINISHED);
 		}
 		return make_uniq<PrepareResponseMessage>(types, names, std::move(results), needs_more_fetch,
 		                                         connection.result_uuid);
@@ -551,7 +571,7 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		}
 		auto assigned_batch_index = connection.next_batch_index++;
 		if (results.size() < max_chunks_per_batch) {
-			connection.query_state = QuackQueryState::FINISHED;
+			connection.SetQueryState(QuackQueryState::FINISHED);
 		}
 		return make_uniq<FetchResponseMessage>(std::move(results), optional_idx(assigned_batch_index));
 	}

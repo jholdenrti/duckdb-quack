@@ -3,6 +3,7 @@
 #include <thread>
 #include <condition_variable>
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
@@ -34,7 +35,16 @@ struct QuackConnection {
 	//! Null-guarded; safe to call when the connection has not issued any query yet.
 	bool InTransaction() const;
 
+	//! Writers of sql_query / query_state / query_started_at hold `lock` and go through these, which also
+	//! take `state_lock` so GetActiveConnectionSnap can read the three fields consistently without `lock`.
+	void StartQuery(const string &sql);
+	void SetQueryState(QuackQueryState state, bool clear_sql = false);
+
 	mutex lock;
+	//! Guards sql_query, query_state and query_started_at for readers that do not hold `lock`
+	//! (GetActiveConnectionSnap). A leaf lock: held only for the field writes/reads themselves,
+	//! never across a query or while acquiring another mutex.
+	mutex state_lock;
 	unique_ptr<Connection> duckdb_connection;
 	unique_ptr<QueryResult> duckdb_query_result;
 	//! Monotonic counter assigned per FETCH batch — enables order-preserving parallel scans on
@@ -45,8 +55,10 @@ struct QuackConnection {
 	string sql_query;
 	QuackQueryState query_state = QuackQueryState::IDLE;
 	timestamp_t query_started_at {0};
-	//! Wall-clock time the last message was handled for this session. Drives the idle reaper.
-	timestamp_t last_activity {0};
+	//! Wall-clock time (timestamp_t micros) the last message was handled for this session. Drives the idle
+	//! reaper. Atomic: HandleMessage stamps it without taking `lock`, and the reaper and the
+	//! active-connections snapshot read it from other threads.
+	atomic<int64_t> last_activity {0};
 };
 
 struct QuackConnectionSnapshot {

@@ -50,6 +50,23 @@ true
 
 endloop
 
+# Over RPC, quack_active_connections() runs inside the PREPARE handler of one of the sessions it
+# snapshots, under that session's own lock: the snapshot must not try to take it (self-deadlock),
+# and concurrent snapshots must not wait on each other's session.
+query I con1
+select count(*) >= 1 from quack_query({server}, 'select * from quack_active_connections()', token='asdf');
+----
+true
+
+concurrentloop i 0 4
+
+query I
+select count(*) >= 1 from quack_query({server}, 'select * from quack_active_connections()', token='asdf');
+----
+true
+
+endloop
+
 # two clients on the same server
 statement ok con1
 attach {server} as rpc3 (token 'asdf');
