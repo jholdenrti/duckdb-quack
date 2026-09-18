@@ -233,6 +233,12 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(DatabaseInstance 
 }
 
 unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &context) const {
+	if (server_invalidated) {
+		throw InvalidInputException(
+		    "The Quack server at %s invalidated its database, so this attached database is gone with it. The "
+		    "server has to be restarted; DETACH and ATTACH again to use it afterwards.",
+		    uri.Uri());
+	}
 	lock_guard<mutex> guard(lock);
 	unique_ptr<QuackClient> result;
 	if (!cached_clients.empty()) {
@@ -244,6 +250,16 @@ unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &c
 		result = QuackClient::GetClient(context, uri);
 	}
 	return make_uniq<QuackClientWrapper>(std::move(result), shared_from_this());
+}
+
+void QuackClient::NoteError(const ErrorResponse &error_response) {
+	if (error_response.MustInvalidate() && owner_connection) {
+		owner_connection->MarkServerInvalidated();
+	}
+}
+
+void QuackClientConnection::MarkServerInvalidated() const {
+	server_invalidated = true;
 }
 
 void QuackClientConnection::StoreClient(unique_ptr<QuackClient> client_p) const {
@@ -258,9 +274,13 @@ void QuackClientConnection::StoreClient(unique_ptr<QuackClient> client_p) const 
 QuackClientWrapper::QuackClientWrapper(unique_ptr<QuackClient> client_p,
                                        shared_ptr<const QuackClientConnection> client_connection_p)
     : client(std::move(client_p)), client_connection(std::move(client_connection_p)) {
+	// while checked out, the client knows which attachment it serves, so an error that kills the server can
+	// mark that attachment dead (see QuackClient::NoteError)
+	client->SetOwnerConnection(client_connection.get());
 }
 
 QuackClientWrapper::~QuackClientWrapper() {
+	client->SetOwnerConnection(nullptr);
 	client_connection->StoreClient(std::move(client));
 }
 

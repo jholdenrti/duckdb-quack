@@ -65,22 +65,26 @@ unique_ptr<DisconnectMessage> DisconnectMessage::Deserialize(Deserializer &deser
 
 void ErrorResponse::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "message", error.RawMessage());
-	serializer.WritePropertyWithDefault<string>(2, "exception_type", Exception::ExceptionTypeToString(error.Type()),
+	serializer.WritePropertyWithDefault<string>(2, "exception_type", ExceptionTypeName(),
 	                                            Exception::ExceptionTypeToString(ExceptionType::INVALID_INPUT));
+	serializer.WritePropertyWithDefault<unordered_map<string, string>>(3, "extra_info", TransferableExtraInfo());
+	serializer.WritePropertyWithDefault<bool>(4, "must_invalidate", must_invalidate);
 }
 
 unique_ptr<ErrorResponse> ErrorResponse::Deserialize(Deserializer &deserializer) {
 	auto message = deserializer.ReadPropertyWithDefault<string>(1, "message");
 	auto exception_type = deserializer.ReadPropertyWithExplicitDefault<string>(
 	    2, "exception_type", Exception::ExceptionTypeToString(ExceptionType::INVALID_INPUT));
+	auto extra_info = deserializer.ReadPropertyWithDefault<unordered_map<string, string>>(3, "extra_info");
+	auto must_invalidate = deserializer.ReadPropertyWithDefault<bool>(4, "must_invalidate");
 	// Rebuild the error with the exception type it had on the sending side. Preserving the type
 	// matters: DuckDB only invalidates the receiving transaction for some exception types
 	// (e.g. INVALID_INPUT) but not others (e.g. BINDER/CATALOG), so collapsing every remote error
 	// to INVALID_INPUT would abort client transactions on benign errors such as table-existence
-	// probes. Note: construct the ErrorData explicitly - a two-string ErrorResponse constructor
-	// would be captured by the variadic format-string constructor and lose the type again.
-	auto result = duckdb::unique_ptr<ErrorResponse>(
-	    new ErrorResponse(ErrorData(Exception::StringToExceptionType(exception_type), std::move(message))));
+	// probes. FromWire also keeps a type that would invalidate the receiving database from
+	// crossing the wire verbatim.
+	auto result =
+	    ErrorResponse::FromWire(std::move(message), std::move(exception_type), std::move(extra_info), must_invalidate);
 	return result;
 }
 

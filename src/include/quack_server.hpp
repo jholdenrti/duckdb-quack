@@ -135,7 +135,9 @@ public:
 	}
 
 protected:
+	//! Handle one request, turning any exception raised along the way into an ErrorResponse
 	unique_ptr<QuackMessage> HandleMessage(MemoryStream &read_stream);
+	unique_ptr<QuackMessage> DispatchMessage(MemoryStream &read_stream);
 	unique_ptr<QuackMessage> HandleMessageInternal(DatabaseInstance &db, QuackMessage &received_message,
 	                                               optional_ptr<QuackConnection> connection);
 
