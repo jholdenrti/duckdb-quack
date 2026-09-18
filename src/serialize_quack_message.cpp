@@ -67,6 +67,10 @@ void ErrorResponse::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "message", error.RawMessage());
 	serializer.WritePropertyWithDefault<string>(2, "exception_type", ExceptionTypeName(),
 	                                            Exception::ExceptionTypeToString(ExceptionType::INVALID_INPUT));
+	if (legacy_peer) {
+		// a v1.5.4 peer throws on a field id it does not know, so it gets the message and type only
+		return;
+	}
 	serializer.WritePropertyWithDefault<unordered_map<string, string>>(3, "extra_info", TransferableExtraInfo());
 	serializer.WritePropertyWithDefault<bool>(4, "must_invalidate", must_invalidate);
 }

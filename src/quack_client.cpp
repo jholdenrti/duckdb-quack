@@ -95,6 +95,8 @@ unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientCo
 	}
 
 	HTTPHeaders headers = extra_headers;
+	// Tell the server this client decodes the extra ErrorResponse fields (see ErrorResponse::EXTRA_FIELDS_HEADER)
+	headers.Insert(ErrorResponse::EXTRA_FIELDS_HEADER, "1");
 
 	// Inject client_query_id from context into the message before sending.
 	// Guard against reading the active query during transaction start itself

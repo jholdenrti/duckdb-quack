@@ -244,7 +244,7 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 		res.status = 204;
 	});
 
-	server->Post("/quack", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &res,
+	server->Post("/quack", [&](const duckdb_httplib::Request &req, duckdb_httplib::Response &res,
 	                           const duckdb_httplib::ContentReader &content_reader) {
 		res.set_header("Access-Control-Allow-Origin", "*");
 		MemoryStream stream;
@@ -253,6 +253,10 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 			return true;
 		});
 		auto response = HandleMessage(stream);
+		if (response->Type() == MessageType::ERROR_RESPONSE && !req.has_header(ErrorResponse::EXTRA_FIELDS_HEADER)) {
+			// a client that predates the extra error fields cannot decode them - see EXTRA_FIELDS_HEADER
+			response->Cast<ErrorResponse>().SetLegacyPeer();
+		}
 		response->ToMemoryStream(stream);
 		res.set_content((const char *)stream.GetData(), stream.GetPosition(), "application/vnd.duckdb");
 	});

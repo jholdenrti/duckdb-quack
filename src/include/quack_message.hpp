@@ -400,6 +400,17 @@ public:
 	static unique_ptr<ErrorResponse> FromWire(const string &message, const string &exception_type,
 	                                          const unordered_map<string, string> &extra_info, bool must_invalidate);
 
+	//! Request header a client sends to say it can decode fields 3 (extra_info) and 4 (must_invalidate).
+	//! DuckDB's binary deserializer rejects a field id it does not know, so a peer that predates those
+	//! fields (v1.5.4) would fail to decode the error instead of reading it. Sent on every request so the
+	//! server needs no per-connection state and connection-less errors are covered too.
+	static constexpr const char *EXTRA_FIELDS_HEADER = "X-Quack-Error-Extra";
+
+	//! The receiver did not send EXTRA_FIELDS_HEADER: stop serializing after field 2.
+	void SetLegacyPeer() {
+		legacy_peer = true;
+	}
+
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<ErrorResponse> Deserialize(Deserializer &deserializer);
 
@@ -411,6 +422,8 @@ private:
 	ErrorData error;
 	//! Set by the server when its OWN database died with this error - see MustInvalidate()
 	bool must_invalidate = false;
+	//! See SetLegacyPeer
+	bool legacy_peer = false;
 };
 
 } // namespace duckdb
