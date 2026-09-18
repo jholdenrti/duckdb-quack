@@ -58,6 +58,10 @@ HttpsQuackClient::HttpsQuackClient(DatabaseInstance &db, const QuackUri &uri_p) 
 HttpsQuackClient::~HttpsQuackClient() {
 }
 
+void HttpsQuackClient::PrepareTeardownRequest() {
+	teardown_request = true;
+}
+
 unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientContext> context,
                                                            unique_ptr<QuackMessage> request_message) {
 	D_ASSERT(request_message);
@@ -77,6 +81,18 @@ unique_ptr<QuackMessage> HttpsQuackClient::RequestInternal(optional_ptr<ClientCo
 	}
 	http_params->timeout = HTTP_TIMEOUT_SECONDS;
 	http_params->retries = 0;
+	if (teardown_request) {
+		// The final DisconnectMessage is best-effort. Against a gone or half-open peer the 24 h timeout
+		// above would block the destructor for that long, so cap it hard and drop retries — a couple of
+		// seconds, then give up. The persistent http_client applied its timeouts when it was created, so
+		// push the new values into it (the same re-Initialize httpfs does for its own cached clients).
+		http_params->timeout = 2;
+		http_params->timeout_usec = 0;
+		http_params->retries = 0;
+		if (http_client) {
+			http_client->Initialize(*http_params);
+		}
+	}
 
 	HTTPHeaders headers = extra_headers;
 
@@ -186,6 +202,9 @@ QuackClientConnection::~QuackClientConnection() {
 	if (!cached_clients.empty()) {
 		try {
 			auto &client = cached_clients.back();
+			// A dead peer at teardown must not block the destructor for the full request timeout.
+			// Bound the transport first.
+			client->PrepareTeardownRequest();
 			client->Request<SuccessResponse>(nullptr, make_uniq<DisconnectMessage>(connection_id));
 		} catch (...) {
 		}

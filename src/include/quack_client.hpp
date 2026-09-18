@@ -42,6 +42,13 @@ public:
 		owner_connection = owner_connection_p;
 	}
 
+	//! Best-effort teardown hint: bound the transport for subsequent (final DisconnectMessage) requests so a
+	//! gone/half-open peer cannot block the destructor for the full request timeout. Default no-op; the HTTPS
+	//! client caps the timeout and skips retries. Not thread-safe — call on a client that is being torn down
+	//! and will issue at most one more request.
+	virtual void PrepareTeardownRequest() {
+	}
+
 	static unique_ptr<QuackClient> GetClient(DatabaseInstance &db, const QuackUri &uri);
 	static unique_ptr<QuackClient> GetClient(ClientContext &context, const QuackUri &uri);
 
@@ -132,6 +139,8 @@ public:
 	HttpsQuackClient(DatabaseInstance &db, const QuackUri &uri_p);
 	~HttpsQuackClient() override;
 
+	void PrepareTeardownRequest() override;
+
 private:
 	unique_ptr<QuackMessage> RequestInternal(optional_ptr<ClientContext> context,
 	                                         unique_ptr<QuackMessage> request_message) override;
@@ -149,6 +158,9 @@ private:
 	// exhaustion under concurrency. request_mutex serializes all use of this
 	// client, so a single reused connection is safe.
 	unique_ptr<HTTPClient> http_client;
+	//! Set by PrepareTeardownRequest(): cap the transport timeout and drop retries so the final
+	//! best-effort DisconnectMessage cannot hang the destructor on a dead peer.
+	bool teardown_request = false;
 };
 
 } // namespace duckdb
