@@ -38,7 +38,7 @@ WORKDIR /workspace
 COPY . .
 
 # Build the extension in release mode using Ninja for faster builds
-ARG OVERRIDE_GIT_DESCRIBE=v1.5.5
+ARG OVERRIDE_GIT_DESCRIBE=v1.5.6
 RUN OVERRIDE_GIT_DESCRIBE=${OVERRIDE_GIT_DESCRIBE} GEN=ninja make release
 
 # The extension will be in build/release/extension/ducklake/
