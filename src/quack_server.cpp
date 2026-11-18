@@ -678,10 +678,17 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		auto &prepare_request_message = received_message.Cast<PrepareRequestMessage>();
 		auto &connection = *connection_p;
 
-		// TODO do not do this if there is no fun set
-		auto authz = EvaluateAuthQuery(
-		    db, StringUtil::Format("SELECT %s(?, ?)", GetSettingString(db, "quack_authorization_function")),
-		    Value(prepare_request_message.ConnectionId()), Value(prepare_request_message.Query()));
+		// The default authorizer (quack_nop_authorization) always allows and returns the query unchanged,
+		// so running it only costs a fresh Connection + parse/plan/execute per PREPARE. Skip it; any other
+		// configured authorizer still runs.
+		auto authz_fn = GetSettingString(db, "quack_authorization_function");
+		AuthCallbackResult authz;
+		if (authz_fn == "quack_nop_authorization") {
+			authz.value = Value::BOOLEAN(true);
+		} else {
+			authz = EvaluateAuthQuery(db, StringUtil::Format("SELECT %s(?, ?)", authz_fn),
+			                          Value(prepare_request_message.ConnectionId()), Value(prepare_request_message.Query()));
+		}
 		if (authz.Denied()) {
 			return authz.Failure("Authorization");
 		}

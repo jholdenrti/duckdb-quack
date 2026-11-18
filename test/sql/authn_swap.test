@@ -203,6 +203,31 @@ FROM quack_query({server}, 'select 42', token='asdf');
 ----
 42
 
+# Phase F: the default authorizer is skipped, not evaluated. Shadow quack_nop_authorization
+# with a macro that throws: with the setting at its default the PREPARE never calls it.
+statement ok quack_db:quack_server_con
+CREATE MACRO quack_nop_authorization(sid, query) AS error('default authorizer was evaluated');
+
+query I
+FROM quack_query({server}, 'select 42', token='asdf');
+----
+42
+
+# Any other name still runs, even when it resolves to the same macro
+statement ok quack_db:quack_server_con
+SET quack_authorization_function = 'main.quack_nop_authorization';
+
+statement error
+FROM quack_query({server}, 'select 42', token='asdf');
+----
+Authorization callback failed: Invalid Input Error: default authorizer was evaluated
+
+statement ok quack_db:quack_server_con
+RESET GLOBAL quack_authorization_function;
+
+statement ok quack_db:quack_server_con
+DROP MACRO quack_nop_authorization;
+
 statement ok quack_db:quack_server_con
 CALL quack_stop({server});
 
