@@ -13,6 +13,7 @@
 #include "quack_uri.hpp"
 
 #include <condition_variable>
+#include <deque>
 
 namespace duckdb {
 
@@ -20,10 +21,20 @@ class QuackCatalog;
 class QuackClient;
 class QuackClientConnection;
 
+//! Connection-pool counters of one catalog, surfaced by quack_pool_status()
+struct QuackPoolStats {
+	idx_t pool_size;
+	idx_t live;
+	idx_t in_use;
+	idx_t idle;
+	//! Connections closed on release because pool_size were already live: raise pool_size if this keeps growing
+	idx_t overflow;
+};
+
 class QuackCatalog : public Catalog {
 public:
 	explicit QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri_p, ClientContext &context,
-	                      const string &token, string client_id, idx_t heartbeat_timeout_seconds);
+	                      const string &token, string client_id, idx_t heartbeat_timeout_seconds, idx_t pool_size = 1);
 	~QuackCatalog() override;
 
 public:
@@ -80,10 +91,29 @@ public:
 	}
 
 	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query);
+	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query,
+	                                                        QuackClientConnection &connection);
 	const QuackUri &GetServerUri();
+	//! The id of the connection opened by ATTACH
 	const string &GetConnectionId();
 
+	//! The connection opened by ATTACH
 	shared_ptr<QuackClientConnection> GetClientConnection();
+	//! The connection "context" talks over: with pool_size > 1 and an active transaction, the pooled connection
+	//! that transaction is pinned to; otherwise the connection opened by ATTACH
+	shared_ptr<QuackClientConnection> GetClientConnection(ClientContext &context);
+
+	//! Check out a connection for one transaction. pool_size 1 always hands out the ATTACH connection. Otherwise
+	//! an idle pooled connection is reused, or a new one is opened
+	shared_ptr<QuackClientConnection> CheckoutConnection(ClientContext &context);
+	//! Return a connection from CheckoutConnection. It goes back to the idle set unless it is dirty (its
+	//! server-side state is unknown) or pool_size connections are live already; then it is dropped, which
+	//! DISCONNECTs it
+	void ReleaseConnection(const shared_ptr<QuackClientConnection> &connection, bool dirty);
+	idx_t PoolSize() const {
+		return pool_size;
+	}
+	QuackPoolStats GetPoolStats();
 
 	void Refresh(ClientContext &context);
 	void Invalidate();
@@ -104,6 +134,19 @@ private:
 
 private:
 	shared_ptr<QuackClientConnection> client_connection;
+	//! What a pooled connection is minted with, resolved at ATTACH: a mint runs without a context, so it cannot
+	//! consult the secret manager
+	string token;
+	string client_id;
+	idx_t heartbeat_timeout_seconds;
+	idx_t pool_size;
+	mutex pool_lock;
+	//! Warm pooled connections (never the ATTACH connection); each keeps its own heartbeat running
+	std::deque<shared_ptr<QuackClientConnection>> idle_connections;
+	//! Live connections, the ATTACH connection included
+	idx_t live_count = 1;
+	idx_t in_use_count = 0;
+	idx_t overflow_count = 0;
 	mutex snapshot_lock;
 	std::condition_variable snapshot_loaded;
 	shared_ptr<QuackSchemaSet> snapshot;

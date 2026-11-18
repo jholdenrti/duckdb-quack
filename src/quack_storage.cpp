@@ -112,8 +112,8 @@ static unique_ptr<Catalog> QuackAttach(optional_ptr<StorageExtensionInfo> storag
 		                              name);
 	}
 	// the options the core did not consume are ours; the parser lower-cases their names
-	static const unordered_set<string> KNOWN_OPTIONS {"token",           "secret",    "disable_ssl",
-	                                                  "ssl_fingerprint", "client_id", "heartbeat_timeout"};
+	static const unordered_set<string> KNOWN_OPTIONS {
+	    "token", "secret", "disable_ssl", "ssl_fingerprint", "client_id", "heartbeat_timeout", "pool_size"};
 	for (auto &entry : attach_options.options) {
 		if (KNOWN_OPTIONS.find(entry.first) == KNOWN_OPTIONS.end()) {
 			throw BinderException("Unrecognized option for attach \"%s\"", entry.first);
@@ -179,11 +179,20 @@ static unique_ptr<Catalog> QuackAttach(optional_ptr<StorageExtensionInfo> storag
 	auto heartbeat_timeout_entry = attach_options.options.find("heartbeat_timeout");
 	auto heartbeat_timeout = QuackClient::ResolveHeartbeatTimeout(
 	    context, heartbeat_timeout_entry != attach_options.options.end() ? &heartbeat_timeout_entry->second : nullptr);
+	idx_t pool_size = 1;
+	auto pool_size_entry = attach_options.options.find("pool_size");
+	if (pool_size_entry != attach_options.options.end()) {
+		auto requested = pool_size_entry->second.GetValue<int64_t>();
+		if (requested < 1) {
+			throw InvalidInputException("pool_size must be at least 1, got %lld", requested);
+		}
+		pool_size = NumericCast<idx_t>(requested);
+	}
 	QuackUri server_uri(uri, enable_ssl);
 	if (!ssl_fingerprint.empty()) {
 		server_uri.SetSslFingerprint(ssl_fingerprint);
 	}
-	return make_uniq<QuackCatalog>(db, server_uri, context, token, std::move(client_id), heartbeat_timeout);
+	return make_uniq<QuackCatalog>(db, server_uri, context, token, std::move(client_id), heartbeat_timeout, pool_size);
 }
 
 static unique_ptr<TransactionManager> QuackCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,

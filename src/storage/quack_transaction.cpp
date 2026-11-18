@@ -3,6 +3,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "storage/quack_catalog.hpp"
+#include "quack_client.hpp"
 
 namespace duckdb {
 
@@ -14,6 +15,8 @@ QuackTransaction::QuackTransaction(QuackCatalog &quack_catalog_p, TransactionMan
 }
 
 QuackTransaction::~QuackTransaction() {
+	// not released by Commit/Rollback (e.g. COMMIT threw): the server-side state is unknown
+	ReleaseConnection(true);
 }
 
 void QuackTransaction::Start() {
@@ -32,6 +35,7 @@ void QuackTransaction::Commit() {
 		transaction_state = QuackTransactionState::TRANSACTION_FINISHED;
 		Query("COMMIT");
 	}
+	ReleaseConnection(false);
 }
 
 void QuackTransaction::Rollback() {
@@ -39,6 +43,23 @@ void QuackTransaction::Rollback() {
 		transaction_state = QuackTransactionState::TRANSACTION_FINISHED;
 		Query("ROLLBACK");
 	}
+	ReleaseConnection(false);
+}
+
+shared_ptr<QuackClientConnection> QuackTransaction::GetConnection(ClientContext &context) {
+	if (!connection) {
+		connection = quack_catalog.CheckoutConnection(context);
+	}
+	return connection;
+}
+
+void QuackTransaction::ReleaseConnection(bool force_dirty) {
+	if (!connection) {
+		return;
+	}
+	auto released = std::move(connection);
+	connection = nullptr;
+	quack_catalog.ReleaseConnection(released, dirty || force_dirty);
 }
 
 void QuackTransaction::Retain(shared_ptr<QuackSchemaSet> snapshot) {
@@ -69,10 +90,16 @@ unique_ptr<ColumnDataCollection> QuackTransaction::Query(const string &query) {
 	ForceStart();
 	auto context_ref = context.lock();
 	if (!context_ref) {
-		// context has been destroyed - silently ignore the query
+		// context has been destroyed - silently ignore the query (a server transaction may stay open on it)
+		dirty = true;
 		return nullptr;
 	}
-	return quack_catalog.ExecuteCommandInternal(*context_ref, query);
+	try {
+		return quack_catalog.ExecuteCommandInternal(*context_ref, query, *GetConnection(*context_ref));
+	} catch (...) {
+		dirty = true;
+		throw;
+	}
 }
 
 } // namespace duckdb

@@ -30,11 +30,16 @@
 namespace duckdb {
 
 QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
-                           const string &token, string client_id, idx_t heartbeat_timeout_seconds)
-    : Catalog(db_p) {
+                           const string &token_p, string client_id_p, idx_t heartbeat_timeout_seconds_p,
+                           idx_t pool_size_p)
+    : Catalog(db_p), token(token_p), client_id(std::move(client_id_p)),
+      heartbeat_timeout_seconds(heartbeat_timeout_seconds_p), pool_size(pool_size_p) {
+	// resolve the token now, while there is a context: pooled connections are minted without one
+	auto resolved_uri = server_uri;
+	QuackClient::ResolveFromSecret(context, resolved_uri, token);
 	// connect to the server
 	client_connection =
-	    QuackClient::ConnectToServer(context, server_uri, token, std::move(client_id), heartbeat_timeout_seconds);
+	    QuackClient::ConnectToServer(context, resolved_uri, token, client_id, heartbeat_timeout_seconds);
 
 	// load the entire catalog up-front
 	auto load_info = LoadCatalog(context);
@@ -106,12 +111,17 @@ const QuackUri &QuackCatalog::GetServerUri() {
 }
 
 unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
+	return ExecuteCommandInternal(context, query, *client_connection);
+}
+
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query,
+                                                                      QuackClientConnection &connection) {
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
-	auto client_wrapper = client_connection->GetClient(context);
+	auto client_wrapper = connection.GetClient(context);
 	auto &client = client_wrapper->GetClient();
-	auto response =
-	    client.Request<PrepareResponseMessage>(context, make_uniq<PrepareRequestMessage>(GetConnectionId(), query, 0));
+	auto response = client.Request<PrepareResponseMessage>(
+	    context, make_uniq<PrepareRequestMessage>(connection.ConnectionId(), query, 0));
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
@@ -125,7 +135,8 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientCont
 		for (idx_t batch_index = 1;; batch_index++) {
 			// ack everything before this batch: we never ask for an earlier batch again
 			auto fetch_response = client.Request<FetchResponseMessage>(
-			    context, make_uniq<FetchRequestMessage>(GetConnectionId(), query_uuid, batch_index, batch_index - 1));
+			    context,
+			    make_uniq<FetchRequestMessage>(connection.ConnectionId(), query_uuid, batch_index, batch_index - 1));
 			if (fetch_response->MutableResults().empty()) {
 				// an empty FETCH is how the server says the result is exhausted (cf. QuackScan)
 				break;
@@ -140,6 +151,75 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientCont
 
 shared_ptr<QuackClientConnection> QuackCatalog::GetClientConnection() {
 	return client_connection;
+}
+
+shared_ptr<QuackClientConnection> QuackCatalog::GetClientConnection(ClientContext &context) {
+	// pool_size 1 keeps every request on the ATTACH connection, exactly as without a pool: a per-transaction
+	// checkout there would only wrap reads in BEGIN/COMMIT on that one shared connection
+	if (pool_size <= 1 || !context.transaction.HasActiveTransaction()) {
+		return client_connection;
+	}
+	// Get (not TryGet) starts this catalog's transaction if needed: DuckLake's metadata connection reaches
+	// us through quack_query_by_name without having touched the catalog before, and TryGet would hand
+	// every such read the shared ATTACH connection
+	return QuackTransaction::Get(context, *this).GetConnection(context);
+}
+
+shared_ptr<QuackClientConnection> QuackCatalog::CheckoutConnection(ClientContext &context) {
+	if (pool_size <= 1) {
+		return client_connection;
+	}
+	{
+		lock_guard<mutex> guard(pool_lock);
+		in_use_count++;
+		if (!idle_connections.empty()) {
+			auto connection = std::move(idle_connections.front());
+			idle_connections.pop_front();
+			return connection;
+		}
+		live_count++;
+	}
+	// Nothing idle: open another connection, even past pool_size. Waiting for a release instead deadlocks
+	// under DuckLake, which serializes every metadata query of a catalog behind one lock - the waiter holds
+	// that lock while each transaction it waits on needs it to make progress. pool_size bounds the idle
+	// connections kept warm; a burst beyond it gets connections that close on release.
+	try {
+		// context-free: the handshake must not re-enter the lock of the query that is running
+		return QuackClient::ConnectToServer(*context.db, GetServerUri(), token, client_id, heartbeat_timeout_seconds);
+	} catch (...) {
+		lock_guard<mutex> guard(pool_lock);
+		live_count--;
+		in_use_count--;
+		throw;
+	}
+}
+
+void QuackCatalog::ReleaseConnection(const shared_ptr<QuackClientConnection> &connection, bool dirty) {
+	if (pool_size <= 1 || connection == client_connection) {
+		return;
+	}
+	lock_guard<mutex> guard(pool_lock);
+	in_use_count--;
+	if (!dirty && !connection->ServerInvalidated() && live_count <= pool_size) {
+		idle_connections.push_back(connection);
+		return;
+	}
+	// the caller holds the last reference; dropping it stops the heartbeat and DISCONNECTs
+	live_count--;
+	if (!dirty) {
+		overflow_count++;
+	}
+}
+
+QuackPoolStats QuackCatalog::GetPoolStats() {
+	lock_guard<mutex> guard(pool_lock);
+	QuackPoolStats stats;
+	stats.pool_size = pool_size;
+	stats.live = live_count;
+	stats.in_use = in_use_count;
+	stats.idle = idle_connections.size();
+	stats.overflow = overflow_count;
+	return stats;
 }
 
 void QuackCatalog::Refresh(ClientContext &context) {
