@@ -27,7 +27,7 @@ env:
   EXT: quack
   DUCKDB_VERSION: v2.0.0
   # sha256 of the DER SubjectPublicKeyInfo of .github/rti-public-key.pem. Rotating the key = change both.
-  RTI_EXT_KEY_FPR: sha256:b9d8e27262810d116fe414a61c6df2f5a246a977012a085bbff511828a3f3235
+  RTI_EXT_KEY_FPR: sha256:b22b85be0dc8793d2994f4ed271e2fbce80b6288d78dbf9d14e2f52342e920f4
 
 jobs:
   build:
