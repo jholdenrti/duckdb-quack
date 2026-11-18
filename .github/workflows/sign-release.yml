@@ -17,8 +17,7 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,9 +32,12 @@ env:
 jobs:
   build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
+    permissions:
+      contents: read
+    # Pinned to the v2.0-cyanoptera branch head (a moving branch, not a tag); bump both together.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@32100e613d23558024786a932622c08cea0a6299 # v2.0-cyanoptera
     with:
-      ci_tools_version: v2.0-cyanoptera
+      ci_tools_version: 32100e613d23558024786a932622c08cea0a6299
       extension_name: quack
       duckdb_version: v2.0.0
       exclude_archs: 'linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;wasm_eh;wasm_mvp;wasm_threads;windows_amd64;windows_amd64_mingw;windows_arm64'
@@ -49,10 +51,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github
+          persist-credentials: false
 
       - name: Check the pinned public key
         run: |
@@ -60,7 +65,7 @@ jobs:
           fpr="sha256:$(openssl pkey -pubin -in .github/rti-public-key.pem -outform DER | sha256sum | cut -d' ' -f1)"
           [ "$fpr" = "$RTI_EXT_KEY_FPR" ] || { echo "::error::public key fingerprint $fpr != $RTI_EXT_KEY_FPR"; exit 1; }
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ${{ env.EXT }}-${{ env.DUCKDB_VERSION }}-extension-linux_*-rti
           path: in
@@ -82,14 +87,20 @@ jobs:
             cp "$f" "in/$arch.unsigned"
           done
 
-      - name: Sign
+      # The secret is in env for this step only; later steps read the mode-600 file.
+      - name: Write signing key
         env:
           RTI_EXT_SIGNING_KEY: ${{ secrets.RTI_EXT_SIGNING_KEY }}
         run: |
           set -euo pipefail
           umask 077
-          key="$RUNNER_TEMP/k.pem"; trap 'rm -f "$key"' EXIT
-          printenv RTI_EXT_SIGNING_KEY > "$key"
+          printenv RTI_EXT_SIGNING_KEY > "$RUNNER_TEMP/k.pem"
+          chmod 600 "$RUNNER_TEMP/k.pem"
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/k.pem"
           for arch in linux_amd64 linux_arm64; do
             d=$(mktemp -d)
             head -c -256 "in/$arch.unsigned" > "$d/body"
@@ -101,6 +112,10 @@ jobs:
             [ "$(stat -c%s "$d/sig")" = 256 ]
             cat "$d/body" "$d/sig" > "out/$EXT.$arch.signed.duckdb_extension"
           done
+
+      - name: Shred signing key
+        if: always()
+        run: shred -u "$RUNNER_TEMP/k.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/k.pem"
 
       - name: Verify against the committed public key
         run: |
@@ -116,7 +131,7 @@ jobs:
           done
           cat out/*.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.EXT }}-${{ env.DUCKDB_VERSION }}-signed
           path: out/
@@ -130,7 +145,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ env.EXT }}-${{ env.DUCKDB_VERSION }}-signed
           path: out
