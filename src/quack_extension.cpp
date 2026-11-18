@@ -283,6 +283,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(QuackScanFromClientFunction::GetFunction());
 	loader.RegisterFunction(QuackServeFunction::GetFunction());
 	loader.RegisterFunction(QuackCancelFunction::GetFunction());
+	loader.RegisterFunction(QuackPoolStatusFunction::GetFunction());
 	loader.RegisterFunction(QuackStopFunction::GetFunction());
 	loader.RegisterFunction(QuackServerListFunction::GetFunction());
 	loader.RegisterFunction(QuackGenerateKeysFunction::GetFunction());

@@ -2,7 +2,10 @@
 #include "duckdb.hpp"
 #include "duckdb/main/database.hpp"
 
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "quack_storage.hpp"
+#include "storage/quack_catalog.hpp"
 
 namespace duckdb {
 
@@ -75,6 +78,42 @@ static void QuackActiveConnectionsScan(ClientContext &context, TableFunctionInpu
 
 TableFunction QuackActiveConnectionsFunction::GetFunction() {
 	return TableFunction("quack_active_connections", {}, QuackActiveConnectionsScan, QuackActiveConnectionsBind);
+}
+
+static unique_ptr<FunctionData> QuackPoolStatusBind(ClientContext &, TableFunctionBindInput &,
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
+	                LogicalType::BIGINT,  LogicalType::BIGINT, LogicalType::BIGINT};
+	names = {"catalog", "pool_size", "live", "in_use", "idle", "overflow"};
+	return make_uniq<QuackActiveConnectionsData>();
+}
+
+static void QuackPoolStatusScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &data = input.bind_data->CastNoConst<QuackActiveConnectionsData>();
+	if (data.finished) {
+		return;
+	}
+	idx_t row = 0;
+	for (auto &db : DatabaseManager::Get(context).GetDatabases(context)) {
+		auto &catalog = db->GetCatalog();
+		if (catalog.GetCatalogType() != "quack" || row >= STANDARD_VECTOR_SIZE) {
+			continue;
+		}
+		auto stats = catalog.Cast<QuackCatalog>().GetPoolStats();
+		output.data[0].SetValue(row, Value(db->GetName().GetIdentifierName()));
+		output.data[1].SetValue(row, Value::BIGINT(NumericCast<int64_t>(stats.pool_size)));
+		output.data[2].SetValue(row, Value::BIGINT(NumericCast<int64_t>(stats.live)));
+		output.data[3].SetValue(row, Value::BIGINT(NumericCast<int64_t>(stats.in_use)));
+		output.data[4].SetValue(row, Value::BIGINT(NumericCast<int64_t>(stats.idle)));
+		output.data[5].SetValue(row, Value::BIGINT(NumericCast<int64_t>(stats.overflow)));
+		row++;
+	}
+	output.SetChildCardinality(row);
+	data.finished = true;
+}
+
+TableFunction QuackPoolStatusFunction::GetFunction() {
+	return TableFunction("quack_pool_status", {}, QuackPoolStatusScan, QuackPoolStatusBind);
 }
 
 } // namespace duckdb
