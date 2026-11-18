@@ -90,11 +90,9 @@ struct QuackPreparedSendData : public QuackPreparedBatch {
 //! The buffer is the wire body, so a cut needs no second serialization.
 class QuackSendDataFragmentBuilder : public QuackFragmentBuilder {
 public:
-	QuackSendDataFragmentBuilder(ClientContext &context, QuackTableCatalogEntry &table, const string &stream_id_p,
+	QuackSendDataFragmentBuilder(ClientContext &context, const string &connection_id_p, const string &stream_id_p,
 	                             idx_t size_hint)
-	    : stream_id(stream_id_p) {
-		auto &quack_catalog = table.catalog.Cast<QuackCatalog>();
-		connection_id = quack_catalog.GetConnectionId();
+	    : connection_id(connection_id_p), stream_id(stream_id_p) {
 		// Fail before the first batch when the ids cannot fit. 64 covers the fixed fields at max width.
 		if (64 + connection_id.size() + stream_id.size() > QUACK_PAYLOAD_HEADER_BYTES) {
 			throw InternalException("SEND_DATA header does not fit its reserved space");
@@ -144,10 +142,10 @@ private:
 // drains the sends, then a chunk-less terminal SEND_DATA carries the batch count.
 class QuackSendDataEmitter : public QuackBatchEmitter {
 public:
-	QuackSendDataEmitter(ClientContext &context, QuackTableCatalogEntry &table_p, string stream_id_p,
-	                     hugeint_t query_uuid_p, idx_t debug_delay_ms_p, bool debug_duplicate_sends_p,
-	                     idx_t debug_drop_batch_p)
-	    : context(context.shared_from_this()), table(table_p), stream_id(std::move(stream_id_p)),
+	QuackSendDataEmitter(ClientContext &context, QuackTableCatalogEntry &table_p,
+	                     shared_ptr<QuackClientConnection> connection_p, string stream_id_p, hugeint_t query_uuid_p,
+	                     idx_t debug_delay_ms_p, bool debug_duplicate_sends_p, idx_t debug_drop_batch_p)
+	    : context(context.shared_from_this()), connection(std::move(connection_p)), stream_id(std::move(stream_id_p)),
 	      query_uuid(query_uuid_p), debug_delay_ms(debug_delay_ms_p), debug_duplicate_sends(debug_duplicate_sends_p),
 	      debug_drop_batch(debug_drop_batch_p) {
 		queue = make_uniq<ManagedAsyncTaskQueue>(context);
@@ -165,9 +163,8 @@ public:
 		}
 		try {
 			if (auto live = context.lock()) {
-				auto &quack_catalog = table.catalog.Cast<QuackCatalog>();
-				auto client_wrapper = quack_catalog.GetClientConnection()->GetClient(*live);
-				auto cancel = make_uniq<CancelRequestMessage>(quack_catalog.GetConnectionId(), query_uuid);
+				auto client_wrapper = connection->GetClient(*live);
+				auto cancel = make_uniq<CancelRequestMessage>(connection->ConnectionId(), query_uuid);
 				client_wrapper->GetClient().Request<SuccessResponse>(*live, std::move(cancel));
 			}
 		} catch (...) { // NOLINT: best effort
@@ -175,7 +172,7 @@ public:
 	}
 
 	unique_ptr<QuackFragmentBuilder> OpenFragment(ClientContext &context, idx_t size_hint) override {
-		return make_uniq<QuackSendDataFragmentBuilder>(context, table, stream_id, size_hint);
+		return make_uniq<QuackSendDataFragmentBuilder>(context, connection->ConnectionId(), stream_id, size_hint);
 	}
 
 	//! Always true: the queue does not refuse work. ApplyBackpressure holds the producer thread.
@@ -196,8 +193,6 @@ public:
 			return true;
 		}
 
-		auto &quack_catalog = table.catalog.Cast<QuackCatalog>();
-
 		// DEBUG SETTING: send the same batch again, to imitate a retry. The receiver must drop it.
 		unique_ptr<MemoryStream> duplicate;
 		if (debug_duplicate_sends) {
@@ -207,13 +202,13 @@ public:
 
 		auto connection_id = prepared->connection_id;
 		auto client_query_id = prepared->client_query_id;
-		auto client_wrapper = quack_catalog.GetClientConnection()->GetClient(context);
+		auto client_wrapper = connection->GetClient(context);
 		queue->Register(make_uniq<QuackSendDataTask>(std::move(client_wrapper), std::move(prepared->payload),
 		                                             body_start, body_size, connection_id, client_query_id,
 		                                             context.logger, debug_delay_ms),
 		                body_size);
 		if (duplicate) {
-			auto retry_wrapper = quack_catalog.GetClientConnection()->GetClient(context);
+			auto retry_wrapper = connection->GetClient(context);
 			queue->Register(make_uniq<QuackSendDataTask>(std::move(retry_wrapper), std::move(duplicate), 0, body_size,
 			                                             std::move(connection_id), client_query_id, context.logger,
 			                                             debug_delay_ms),
@@ -228,19 +223,18 @@ public:
 		queue->Close();
 		queue.reset();
 
-		auto &quack_catalog = table.catalog.Cast<QuackCatalog>();
-		auto client_wrapper = quack_catalog.GetClientConnection()->GetClient(context);
+		auto client_wrapper = connection->GetClient(context);
 		auto &client = client_wrapper->GetClient();
 
 		// The terminal message is an ordinary SEND_DATA with no chunks. It closes the stream against the
 		// batch count, so a lost batch fails the statement.
-		auto terminal = make_uniq<SendDataRequestMessage>(quack_catalog.GetConnectionId(), stream_id);
+		auto terminal = make_uniq<SendDataRequestMessage>(connection->ConnectionId(), stream_id);
 		terminal->SetTotalBatches(total_batches);
 		client.Request<SendDataResponseMessage>(context, std::move(terminal));
 
 		// The statement's result is one row: the rows it changed. Fetch it like any result, so a
 		// failure after the last batch surfaces here too.
-		auto fetch = make_uniq<FetchRequestMessage>(quack_catalog.GetConnectionId(), query_uuid, 1, 1);
+		auto fetch = make_uniq<FetchRequestMessage>(connection->ConnectionId(), query_uuid, 1, 1);
 		auto response = client.Request<FetchResponseMessage>(context, std::move(fetch));
 		for (auto &chunk : response->MutableResults()) {
 			if (chunk->size() > 0 && chunk->ColumnCount() > 0) {
@@ -252,7 +246,8 @@ public:
 
 private:
 	weak_ptr<ClientContext> context;
-	QuackTableCatalogEntry &table;
+	//! The connection the INSERT was prepared on; every batch, the terminal message and a cancel go there too
+	shared_ptr<QuackClientConnection> connection;
 	string stream_id;
 	hugeint_t query_uuid;
 	idx_t debug_delay_ms;
@@ -263,10 +258,11 @@ private:
 };
 
 unique_ptr<QuackBatchEmitter> MakeQuackSendDataEmitter(ClientContext &context, QuackTableCatalogEntry &table,
-                                                       string stream_id, hugeint_t query_uuid, idx_t debug_delay_ms,
+                                                       shared_ptr<QuackClientConnection> connection, string stream_id,
+                                                       hugeint_t query_uuid, idx_t debug_delay_ms,
                                                        bool debug_duplicate_sends, idx_t debug_drop_batch) {
-	return make_uniq<QuackSendDataEmitter>(context, table, std::move(stream_id), query_uuid, debug_delay_ms,
-	                                       debug_duplicate_sends, debug_drop_batch);
+	return make_uniq<QuackSendDataEmitter>(context, table, std::move(connection), std::move(stream_id), query_uuid,
+	                                       debug_delay_ms, debug_duplicate_sends, debug_drop_batch);
 }
 
 } // namespace duckdb

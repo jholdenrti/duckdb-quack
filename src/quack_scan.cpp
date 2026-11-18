@@ -1,3 +1,4 @@
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -123,7 +124,8 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	// TODO some of this stuff below is duplicated af
 	auto query = input.inputs[1].GetValue<string>();
 	auto bind_data = make_uniq<QuackScanBindData>();
-	bind_data->client_connection = catalog.GetClientConnection();
+	// with a pool, the connection of this transaction - the PREPARE below runs the query, so this is where it lands
+	bind_data->client_connection = catalog.GetClientConnection(context);
 	auto client_wrapper = bind_data->client_connection->GetClient(context);
 	auto &client = client_wrapper->GetClient();
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
@@ -284,6 +286,11 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 		if (!input.column_indexes.empty()) {
 			fetch_pushdown_type = ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED;
 		}
+		// Resolve the connection per execution, not per bind: a prepared scan outlives the transaction whose
+		// pooled connection was current when it was bound
+		auto &mutable_bind_data = input.bind_data->CastNoConst<QuackScanBindData>();
+		auto &quack_catalog = mutable_bind_data.table_entry->ParentCatalog().Cast<QuackCatalog>();
+		mutable_bind_data.client_connection = quack_catalog.GetClientConnection(context);
 		auto &client_connection = *bind_data.client_connection;
 		auto client_wrapper = client_connection.GetClient(context);
 		auto &client = client_wrapper->GetClient();
