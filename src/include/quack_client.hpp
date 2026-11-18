@@ -40,7 +40,8 @@ public:
 		return unique_ptr_cast<QuackMessage, TARGET>(std::move(response_message));
 	}
 
-	//! Invalidate the owning connection if the error says the server's database died. Call before rethrowing.
+	//! Mark the owning connection as having failed a request, and invalidate it if the error says the server's
+	//! database died. Call before rethrowing.
 	void NoteError(const ErrorResponse &error_response);
 
 	//! The connection this client is checked out from - set by QuackClientWrapper. Null for the initial connect
@@ -157,6 +158,11 @@ public:
 	bool ServerInvalidated() const {
 		return server_invalidated;
 	}
+	//! Whether a request on this connection failed on the server since the last call, and reset it. The failed
+	//! statement may have left the server session inside a transaction the client never started
+	bool TakeRequestFailed() {
+		return request_failed.exchange(false);
+	}
 
 private:
 	friend class QuackClient;
@@ -172,6 +178,7 @@ private:
 	idx_t heartbeat_timeout_seconds;
 	mutable mutex lock;
 	mutable atomic<bool> server_invalidated {false};
+	mutable atomic<bool> request_failed {false};
 	//! Bounds cached_clients: each cached client holds a persistent socket that pins a server
 	//! connection slot, so an unbounded cache would let one attach starve the server's budget.
 	idx_t max_connections_cached;

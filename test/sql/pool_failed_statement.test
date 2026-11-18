@@ -1,0 +1,39 @@
+# name: test/sql/pool_failed_statement.test
+# description: pool_size - a pooled connection whose statement failed is not handed to the next transaction
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t(i INTEGER PRIMARY KEY)
+
+statement ok quack_db:quack_server_con
+insert into t values (1)
+
+statement ok
+attach {server} as p (token 'asdf', pool_size 3)
+
+# DuckLake's metadata commit shape: a BEGIN ... COMMIT batch sent through quack_query_by_name. The duplicate key
+# fails it mid-way and leaves the server session in an aborted transaction the client never started, so the
+# client-side ROLLBACK sends nothing. Handing that connection to the next transaction failed it with
+# "Current transaction is aborted".
+statement error
+from quack_query_by_name('p', 'BEGIN TRANSACTION; INSERT INTO t VALUES (1); COMMIT;')
+----
+Duplicate key
+
+query I
+from quack_query_by_name('p', 'SELECT count(*) FROM t')
+----
+1
+
+# the failed connection was closed, not pooled: only the one that ran the count is idle
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+2	0	1
+
+statement ok
+detach p
+
+include test/template/quack_teardown.test_template

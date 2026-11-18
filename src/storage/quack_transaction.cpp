@@ -59,7 +59,12 @@ void QuackTransaction::ReleaseConnection(bool force_dirty) {
 	}
 	auto released = std::move(connection);
 	connection = nullptr;
-	quack_catalog.ReleaseConnection(released, dirty || force_dirty);
+	// A failed request may have left the server session inside a transaction we never started - e.g. DuckLake's
+	// "BEGIN; ...; COMMIT" metadata batch sent through quack_query_by_name failing mid-way leaves it aborted. Only
+	// a COMMIT/ROLLBACK we sent ourselves (TRANSACTION_FINISHED and not dirty) is known to have ended it.
+	bool request_failed = released->TakeRequestFailed();
+	bool ended_server_transaction = transaction_state == QuackTransactionState::TRANSACTION_FINISHED;
+	quack_catalog.ReleaseConnection(released, dirty || force_dirty || (request_failed && !ended_server_transaction));
 }
 
 void QuackTransaction::Retain(shared_ptr<QuackSchemaSet> snapshot) {

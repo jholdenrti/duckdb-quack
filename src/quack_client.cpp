@@ -517,7 +517,11 @@ unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &c
 }
 
 void QuackClient::NoteError(const ErrorResponse &error_response) {
-	if (error_response.MustInvalidate() && owner_connection) {
+	if (!owner_connection) {
+		return;
+	}
+	owner_connection->request_failed = true;
+	if (error_response.MustInvalidate()) {
 		owner_connection->MarkServerInvalidated();
 	}
 }
