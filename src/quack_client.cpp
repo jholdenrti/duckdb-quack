@@ -403,6 +403,26 @@ idx_t QuackClient::ResolveHeartbeatTimeout(ClientContext &context, optional_ptr<
 	return timeout_seconds;
 }
 
+void QuackClient::ResolveFromSecret(ClientContext &context, QuackUri &uri, string &token) {
+	if (!token.empty() && !uri.SslFingerprint().empty()) {
+		return;
+	}
+	// canonical form, so the scope match does not depend on how the endpoint was spelled
+	auto secret = QuackSecret::Find(context, nullptr, uri.CanonicalUri());
+	if (!secret) {
+		return;
+	}
+	if (token.empty()) {
+		token = QuackSecret::GetToken(*secret);
+	}
+	string secret_fingerprint;
+	if (uri.SslFingerprint().empty() && QuackSecret::TryGetSslFingerprint(*secret, secret_fingerprint)) {
+		// a pin only makes sense over TLS, so it turns HTTPS on
+		uri.SetSslFingerprint(secret_fingerprint);
+		uri.SetSsl(true);
+	}
+}
+
 shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &context, const QuackUri &uri,
                                                                string token, string client_id,
                                                                idx_t heartbeat_timeout_seconds) {
@@ -413,27 +433,34 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 	// whatever the caller did not supply comes from the secret manager: the token, and the pinned server
 	// certificate fingerprint
 	auto server_uri = uri;
-	if (token.empty() || server_uri.SslFingerprint().empty()) {
-		// canonical form, so the scope match does not depend on how the endpoint was spelled
-		auto secret = QuackSecret::Find(context, nullptr, uri.CanonicalUri());
-		if (secret) {
-			if (token.empty()) {
-				token = QuackSecret::GetToken(*secret);
-			}
-			string secret_fingerprint;
-			if (server_uri.SslFingerprint().empty() && QuackSecret::TryGetSslFingerprint(*secret, secret_fingerprint)) {
-				// a pin only makes sense over TLS, so it turns HTTPS on
-				server_uri.SetSslFingerprint(secret_fingerprint);
-				server_uri.SetSsl(true);
-			}
-		}
-	}
+	ResolveFromSecret(context, server_uri, token);
 	if (token.empty()) {
 		throw InvalidInputException("Could not find a Quack authentication token");
 	}
+	// Cache at most one client per async send slot: pending SEND_DATA tasks can check out far more
+	// clients than ever POST concurrently, and each cached client pins a server connection slot.
+	idx_t max_cached = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfAsyncThreads());
+	return Connect(context, *context.db, server_uri, token, std::move(client_id), heartbeat_timeout_seconds,
+	               max_cached);
+}
 
+shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(DatabaseInstance &db, const QuackUri &uri,
+                                                               const string &token, string client_id,
+                                                               idx_t heartbeat_timeout_seconds) {
+	ValidateClientId(client_id);
+	ValidateHeartbeatTimeout(heartbeat_timeout_seconds);
+	if (token.empty()) {
+		throw InvalidInputException("Could not find a Quack authentication token");
+	}
+	idx_t max_cached = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(db).NumberOfAsyncThreads());
+	return Connect(nullptr, db, uri, token, std::move(client_id), heartbeat_timeout_seconds, max_cached);
+}
+
+shared_ptr<QuackClientConnection> QuackClient::Connect(optional_ptr<ClientContext> context, DatabaseInstance &db,
+                                                       const QuackUri &uri, const string &token, string client_id,
+                                                       idx_t heartbeat_timeout_seconds, idx_t max_connections_cached) {
 	// open a HTTP client to the server
-	auto client = QuackClient::GetClient(context, server_uri);
+	auto client = QuackClient::GetClient(db, uri);
 
 	// submit the connection request
 	auto connection_request_response = client->Request<ConnectionResponseMessage>(
@@ -447,12 +474,8 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 	ValidateHeartbeatTimeout(accepted_heartbeat_timeout_seconds);
 	// success! we got a connection id
 	auto connection_id = connection_request_response->ConnectionId();
-	// Cache at most one client per async send slot: pending SEND_DATA tasks can check out far more
-	// clients than ever POST concurrently, and each cached client pins a server connection slot.
-	idx_t pool_size = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfAsyncThreads());
-	auto connection =
-	    make_shared_ptr<QuackClientConnection>(*context.db, std::move(client), server_uri, std::move(connection_id),
-	                                           accepted_heartbeat_timeout_seconds, pool_size);
+	auto connection = make_shared_ptr<QuackClientConnection>(db, std::move(client), uri, std::move(connection_id),
+	                                                         accepted_heartbeat_timeout_seconds, max_connections_cached);
 	connection->StartHeartbeat();
 	return connection;
 }

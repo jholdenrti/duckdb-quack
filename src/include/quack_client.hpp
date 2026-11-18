@@ -83,6 +83,15 @@ public:
 
 	static shared_ptr<QuackClientConnection> ConnectToServer(ClientContext &context, const QuackUri &uri, string token,
 	                                                         string client_id, idx_t heartbeat_timeout_seconds);
+	//! Context-free connect to an already resolved target (token and pinned certificate filled in, see
+	//! ResolveFromSecret). A pooled connection is minted from inside a running query: threading that query's
+	//! context into the handshake would re-enter its lock.
+	static shared_ptr<QuackClientConnection> ConnectToServer(DatabaseInstance &db, const QuackUri &uri,
+	                                                         const string &token, string client_id,
+	                                                         idx_t heartbeat_timeout_seconds);
+	//! Fill in what the caller did not supply - the token and the pinned server certificate - from the quack
+	//! secret scoped to the URI
+	static void ResolveFromSecret(ClientContext &context, QuackUri &uri, string &token);
 
 	//! Resolve the effective client_id for a new connection
 	static string ResolveClientId(ClientContext &context, optional_ptr<const Value> explicit_value);
@@ -95,6 +104,10 @@ public:
 	static void ValidateHeartbeatTimeout(idx_t heartbeat_timeout_seconds);
 
 protected:
+	static shared_ptr<QuackClientConnection> Connect(optional_ptr<ClientContext> context, DatabaseInstance &db,
+	                                                 const QuackUri &uri, const string &token, string client_id,
+	                                                 idx_t heartbeat_timeout_seconds, idx_t max_connections_cached);
+
 	//! Resolve the logger for a request: the context (per-query) logger when available, else the db logger.
 	Logger &GetRequestLogger(optional_ptr<ClientContext> context);
 
