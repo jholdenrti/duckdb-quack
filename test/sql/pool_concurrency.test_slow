@@ -1,0 +1,132 @@
+# name: test/sql/pool_concurrency.test_slow
+# description: pool_size under real concurrency - concurrent writers, saturation, heartbeats of idle pooled connections
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t(worker INTEGER, i INTEGER)
+
+statement ok quack_db:quack_server_con
+create table counter as select 0 as n
+
+statement ok quack_db:quack_server_con
+create table log(worker INTEGER)
+
+statement ok quack_db:quack_server_con
+CALL enable_logging('Quack');
+
+# heartbeat_timeout 1: a connection that misses its heartbeats loses its lease within a second or two
+statement ok
+attach {server} as p (token 'asdf', pool_size 4, heartbeat_timeout 1)
+
+# --- concurrent writers: 8 workers, 3 warm pooled connections, every insert lands exactly once ---------------
+
+concurrentloop worker 0 8
+
+loop i 0 20
+
+statement ok
+begin
+
+statement ok
+insert into p.t values ({worker}, {i})
+
+statement ok
+insert into p.t values ({worker}, {i} + 1000)
+
+statement ok
+commit
+
+endloop
+
+endloop
+
+query III
+select count(*), count(distinct (worker, i)), count(distinct worker) from p.t
+----
+320	320	8
+
+# every connection came back, and the ones opened past pool_size were closed again
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+4	0	3
+
+# --- concurrent read-modify-write on one row: a conflict aborts the whole transaction, nothing is lost ---
+
+concurrentloop worker 0 8
+
+loop i 0 10
+
+statement maybe
+begin; update p.counter set n = n + 1; insert into p.log values ({worker}); commit;
+----
+onflict
+
+statement maybe
+rollback
+----
+no transaction is active
+
+endloop
+
+endloop
+
+# each committed transaction carried exactly one increment and one log row, and at least one committed
+query II quack_db:quack_server_con
+select n = (select count(*) from log), n > 0 from counter
+----
+true	true
+
+# --- idle pooled connections heartbeat and survive many lease periods --------------------------------
+
+query I
+select idle >= 1 from quack_pool_status() where catalog = 'p'
+----
+true
+
+query I
+select live from quack_pool_status() where catalog = 'p'
+----
+4
+
+sleep 4 seconds
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+4
+
+# every one of them - the ATTACH connection and each pooled one - sent heartbeats of its own. (The server
+# expires a lease lazily, on the session's next request, so the count above alone would not notice.)
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+where connection_id not in (
+	select quack_connection_id from duckdb_logs_parsed('Quack')
+	where message_type = 'HEARTBEAT_REQUEST' and response_type = 'SUCCESS_RESPONSE')
+----
+0
+
+# the warm connections still serve after idling across several leases
+concurrentloop worker 0 4
+
+query I
+select count(*) from p.t where worker = {worker}
+----
+40
+
+endloop
+
+
+# --- detach stops every heartbeat and disconnects every connection -----------------------------------
+
+statement ok
+detach p
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+0
+
+include test/template/quack_teardown.test_template

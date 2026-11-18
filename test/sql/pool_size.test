@@ -1,0 +1,297 @@
+# name: test/sql/pool_size.test
+# description: pool_size ATTACH option - lazy growth, per-transaction pinning, release, discard, detach
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t(i INTEGER)
+
+# --- the option ------------------------------------------------------------------------------------
+
+statement error
+attach {server} as bad (token 'asdf', pool_size 0)
+----
+pool_size must be at least 1
+
+# default: one connection, the one ATTACH opened
+statement ok
+attach {server} as d (token 'asdf')
+
+query IIIII
+select pool_size, live, in_use, idle, overflow from quack_pool_status() where catalog = 'd'
+----
+1	1	0	0	0
+
+# pool_size 1 never mints, whether autocommit or inside a transaction
+statement ok con1
+begin
+
+query I con1
+select count(*) from d.t
+----
+0
+
+statement ok con1
+commit
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'd'
+----
+1	0	0
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+1
+
+statement ok
+detach d
+
+# --- growth and reuse ------------------------------------------------------------------------------
+
+statement ok
+attach {server} as p (token 'asdf', pool_size 3)
+
+query IIII
+select pool_size, live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+3	1	0	0
+
+# an autocommit statement checks a pooled connection out for its own transaction and returns it
+statement ok
+insert into p.t values (1)
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+2	0	1
+
+# the warm connection is reused, not re-minted
+loop i 0 10
+
+query I
+select count(*) from p.t
+----
+1
+
+endloop
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+2	0	1
+
+# --- per-transaction pinning -------------------------------------------------------------------------
+
+# con1 holds a pooled connection for its whole transaction
+statement ok con1
+begin
+
+statement ok con1
+insert into p.t values (2)
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+2	1	0
+
+# its uncommitted row is visible to itself, so every statement ran in one server transaction
+query I con1
+select count(*) from p.t
+----
+2
+
+# a concurrent transaction gets its own connection, and does not see con1's row
+statement ok con2
+begin
+
+query I con2
+select count(*) from p.t
+----
+1
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+3	2	0
+
+statement ok con2
+insert into p.t values (3)
+
+statement ok con1
+commit
+
+query I con2
+select count(*) from p.t
+----
+2
+
+statement ok con2
+commit
+
+query I
+select i from p.t order by i
+----
+1
+2
+3
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+3	0	2
+
+# a write-write conflict between two pinned server transactions surfaces as an error, it is not lost
+statement ok con1
+begin
+
+statement ok con1
+update p.t set i = 10 where i = 1
+
+statement ok con2
+begin
+
+statement error con2
+update p.t set i = 20 where i = 1
+----
+Conflict
+
+statement ok con2
+rollback
+
+statement ok con1
+commit
+
+query I
+select i from p.t order by i
+----
+2
+3
+10
+
+statement ok
+update p.t set i = 1 where i = 10
+
+# rollback discards the transaction's writes and returns its connection clean
+statement ok con1
+begin
+
+statement ok con1
+insert into p.t values (99)
+
+statement ok con1
+rollback
+
+query I
+select count(*) from p.t where i = 99
+----
+0
+
+query III
+select live, in_use, idle from quack_pool_status() where catalog = 'p'
+----
+3	0	2
+
+# an error inside the transaction: after ROLLBACK the pool is whole and usable
+statement ok con1
+begin
+
+statement error con1
+select * from p.does_not_exist
+----
+does not exist
+
+statement ok con1
+rollback
+
+query I con1
+select count(*) from p.t
+----
+3
+
+# --- beyond pool_size ------------------------------------------------------------------------------
+
+# con1 and con2 hold the two pooled connections (the ATTACH connection is not lent out)
+statement ok con1
+begin
+
+query I con1
+select count(*) from p.t
+----
+3
+
+statement ok con2
+begin
+
+query I con2
+select count(*) from p.t
+----
+3
+
+# a third transaction does not wait - waiting can deadlock behind DuckLake's metadata lock - it gets a
+# connection of its own
+statement ok con3
+begin
+
+query I con3
+select count(*) from p.t
+----
+3
+
+query IIII
+select live, in_use, idle, overflow from quack_pool_status() where catalog = 'p'
+----
+4	3	0	0
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+4
+
+# which closes on release once pool_size connections are live again
+statement ok con3
+commit
+
+query IIII
+select live, in_use, idle, overflow from quack_pool_status() where catalog = 'p'
+----
+3	2	0	1
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+3
+
+statement ok con1
+commit
+
+statement ok con2
+commit
+
+query IIII
+select live, in_use, idle, overflow from quack_pool_status() where catalog = 'p'
+----
+3	0	2	1
+
+# --- the server agrees, and DETACH tears every connection down ---------------------------------------
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+3
+
+statement ok
+detach p
+
+query I
+select count(*) from quack_pool_status()
+----
+0
+
+query I quack_db:quack_server_con
+select count(*) from quack_active_connections()
+----
+0
+
+include test/template/quack_teardown.test_template
